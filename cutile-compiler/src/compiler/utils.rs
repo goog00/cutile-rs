@@ -13,6 +13,7 @@ use crate::generics::TypeInstance;
 use crate::syn_utils::{get_ident_from_expr, get_ident_from_path_expr};
 use crate::types::{get_cuda_tile_element_type_from_rust_primitive_str, MLIRVariadicArg};
 use half::f16;
+use half::bfloat16;
 use melior::ir::attribute::{IntegerAttribute, StringAttribute, TypeAttribute};
 use melior::ir::operation::OperationBuilder;
 use melior::ir::r#type::IntegerType;
@@ -208,11 +209,12 @@ impl ElementTypePrefix {
     pub fn new(cuda_elem_ty_str: &str) -> Result<Self, JITError> {
         if cuda_elem_ty_str.starts_with("i") {
             Ok(ElementTypePrefix::Integer)
-        } else if cuda_elem_ty_str.starts_with("f") {
+        } else if cuda_elem_ty_str.starts_with("f") || cuda_elem_ty_str.starts_with("b") {
+            // "f" for f16/f32/f64/tf32, "b" for bf16
             Ok(ElementTypePrefix::Float)
         } else {
             SourceLocation::unknown()
-                .jit_error_result(&format!("unsupported element type `{cuda_elem_ty_str}`; expected an integer (`i...`) or float (`f...`) type"))
+                .jit_error_result(&format!("unsupported element type `{cuda_elem_ty_str}`; expected an integer (`i...`), float (`f...`), or bfloat (`b...`) type"))
         }
     }
 }
@@ -1007,6 +1009,28 @@ impl Float for f16 {
     }
 }
 
+impl Float for bfloat16 {
+    fn to_hex(&self) -> String {
+        format_hex(self.to_bits())
+    }
+    fn zero() -> bfloat16 {
+        bfloat16::ZERO
+    }
+    fn one() -> bfloat16 {
+        bfloat16::ONE
+    }
+    fn negative_infinity() -> bfloat16 {
+        bfloat16::NEG_INFINITY
+    }
+    fn positive_infinity() -> bfloat16 {
+        bfloat16::INFINITY
+    }
+    fn e() -> bfloat16 {
+        // bfloat16 doesn't have a direct E constant, so we convert from f32
+        bfloat16::from_f32(std::f32::consts::E)
+    }
+}
+
 impl Float for f32 {
     fn to_hex(&self) -> String {
         format_hex(self.to_bits())
@@ -1147,6 +1171,7 @@ fn get_integer_const<T: Integer>(const_str: &str) -> Result<String, JITError> {
 pub fn get_const_hex(rust_element_type_str: &str, const_str: &str) -> Result<String, JITError> {
     match rust_element_type_str {
         "f16" => get_float_const::<f16>(const_str),
+        "bf16" => get_float_const::<bfloat16>(const_str),
         "f32" => get_float_const::<f32>(const_str),
         "f64" => get_float_const::<f64>(const_str),
         "i32" => get_integer_const::<i32>(const_str),

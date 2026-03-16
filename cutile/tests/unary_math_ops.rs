@@ -84,6 +84,19 @@ mod unary_math_ops_module {
         let result: Tile<f32, S> = pow(x, y); // x^y
         output.store(result);
     }
+
+    // BF16 unary operations
+    #[cutile::entry()]
+    fn bf16_unary_ops_kernel<const S: [i32; 1]>(output: &mut Tensor<bf16, S>) {
+        // Test bf16 floating-point unary operations
+        let x: Tile<bf16, S> = load_tile_mut(output);
+
+        // Arithmetic operations
+        let t1: Tile<bf16, S> = absf(x); // absolute value (float)
+        let result: Tile<bf16, S> = negf(t1); // negation (float)
+
+        output.store(result);
+    }
 }
 
 use unary_math_ops_module::_module_asts;
@@ -262,5 +275,48 @@ fn compile_pow() -> () {
         );
 
         println!("\n✓ pow operation verified in MLIR output");
+    });
+}
+
+#[test]
+fn compile_bf16_unary_ops() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "unary_math_ops_module",
+            "bf16_unary_ops_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== BF16 UNARY OPS MLIR ===\n{}", module_op_str);
+
+        let expected_ops = ["absf", "negf"];
+        for op in expected_ops {
+            assert!(
+                module_op_str.contains(op),
+                "Expected {} operation in MLIR output",
+                op
+            );
+        }
+        assert!(
+            module_op_str.contains("bf16"),
+            "Expected bf16 type in MLIR output"
+        );
+
+        println!(
+            "\n✓ All {} bf16 unary operations verified in MLIR output",
+            expected_ops.len()
+        );
     });
 }

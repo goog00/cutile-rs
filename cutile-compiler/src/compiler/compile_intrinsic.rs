@@ -91,7 +91,7 @@ impl<'m, 'c> CUDATileFunctionCompiler<'m> {
                         ),
                     );
                 };
-                let (op_name, attrs) = if out_cuda_tile_element_type.starts_with("f") {
+                let (op_name, attrs) = if out_cuda_tile_element_type.starts_with("f") || out_cuda_tile_element_type.starts_with("b") {
                     ("cuda_tile.mmaf", vec![])
                 } else if out_cuda_tile_element_type.starts_with("i") {
                     let Some(lhs_elem_ty) = lhs
@@ -714,6 +714,7 @@ impl<'m, 'c> CUDATileFunctionCompiler<'m> {
                                 );
                             },
                             ("i32", "f16") | ("u32", "f16") | ("i64", "f16") | ("u64", "f16") |
+                            ("i32", "bf16") | ("u32", "bf16") | ("i64", "bf16") | ("u64", "bf16") |
                             ("i32", "f32") | ("u32", "f32") | ("i64", "f32") | ("u64", "f32") |
                             ("i32", "f64") | ("u32", "f64") | ("i64", "f64") | ("u64", "f64") => {
                                 let signedness_attr = get_signedness_attr(&self.context, "signedness", &old_element_type_str)?;
@@ -731,6 +732,7 @@ impl<'m, 'c> CUDATileFunctionCompiler<'m> {
                                     .add_results(&[output_value])
                             },
                             ("f16", "i32") | ("f16", "u32") | ("f16", "i64") | ("f16", "u64") |
+                            ("bf16", "i32") | ("bf16", "u32") | ("bf16", "i64") | ("bf16", "u64") |
                             ("f32", "i32") | ("f32", "u32") | ("f32", "i64") | ("f32", "u64") |
                             ("f64", "i32") | ("f64", "u32") | ("f64", "i64") | ("f64", "u64") => {
                                 let signedness_attr = get_signedness_attr(&self.context, "signedness", &new_element_type_str)?;
@@ -746,8 +748,10 @@ impl<'m, 'c> CUDATileFunctionCompiler<'m> {
                                     .add_operands(&[input_value])
                                     .add_results(&[output_value])
                             },
-                            ("f16", "f32") | ("f16", "f64") | ("f32", "f16") |
-                            ("f32", "f64") | ("f64", "f16") | ("f64", "f32") |
+                            ("f16", "f32") | ("f16", "f64") | ("f16", "bf16") | 
+                            ("bf16", "f16") | ("bf16", "f32") | ("bf16", "f64") |
+                            ("f32", "f16") | ("f32", "f64") | ("f32", "bf16") |
+                            ("f64", "f16") | ("f64", "f32") | ("f64", "bf16") |
                             ("f32", "tf32") | ("tf32", "f32")  => {
                                 let rounding_mode_attr =self.parse_named_attr("rounding_mode", "#cuda_tile.rounding<nearest_even>")?;
                                 let Some(input_value) = arg.value else {

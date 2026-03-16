@@ -45,6 +45,55 @@ mod type_conversion_ops_module {
         let extended: Tile<i64, S> = exti(truncated);
         output.store(extended);
     }
+
+    // BF16 conversion kernels
+    #[cutile::entry()]
+    fn bf16_from_int32_kernel<const S: [i32; 1]>(output: &mut Tensor<bf16, S>) {
+        // Test i32 -> bf16 conversion
+        let x: Tile<i32, S> = load_tile_mut(output);
+        let result: Tile<bf16, S> = convert(x);
+        output.store(result);
+    }
+
+    #[cutile::entry()]
+    fn int32_from_bf16_kernel<const S: [i32; 1]>(output: &mut Tensor<i32, S>) {
+        // Test bf16 -> i32 conversion
+        let x: Tile<bf16, S> = load_tile_mut(output);
+        let result: Tile<i32, S> = convert(x);
+        output.store(result);
+    }
+
+    #[cutile::entry()]
+    fn bf16_from_f32_kernel<const S: [i32; 1]>(output: &mut Tensor<bf16, S>) {
+        // Test f32 -> bf16 conversion
+        let x: Tile<f32, S> = load_tile_mut(output);
+        let result: Tile<bf16, S> = convert(x);
+        output.store(result);
+    }
+
+    #[cutile::entry()]
+    fn f32_from_bf16_kernel<const S: [i32; 1]>(output: &mut Tensor<f32, S>) {
+        // Test bf16 -> f32 conversion
+        let x: Tile<bf16, S> = load_tile_mut(output);
+        let result: Tile<f32, S> = convert(x);
+        output.store(result);
+    }
+
+    #[cutile::entry()]
+    fn bf16_from_f64_kernel<const S: [i32; 1]>(output: &mut Tensor<bf16, S>) {
+        // Test f64 -> bf16 conversion
+        let x: Tile<f64, S> = load_tile_mut(output);
+        let result: Tile<bf16, S> = convert(x);
+        output.store(result);
+    }
+
+    #[cutile::entry()]
+    fn f64_from_bf16_kernel<const S: [i32; 1]>(output: &mut Tensor<f64, S>) {
+        // Test bf16 -> f64 conversion
+        let x: Tile<bf16, S> = load_tile_mut(output);
+        let result: Tile<f64, S> = convert(x);
+        output.store(result);
+    }
 }
 
 use type_conversion_ops_module::_module_asts;
@@ -162,5 +211,209 @@ fn compile_exti_unsigned() -> () {
         );
 
         println!("\n✓ exti with unsigned types (zero extension) verified in MLIR output");
+    });
+}
+
+#[test]
+fn compile_bf16_from_int32() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "type_conversion_ops_module",
+            "bf16_from_int32_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== I32 TO BF16 MLIR ===\n{}", module_op_str);
+
+        assert!(
+            module_op_str.contains("= itof"),
+            "Expected itof operation in MLIR output"
+        );
+        assert!(
+            module_op_str.contains("bf16"),
+            "Expected bf16 type in MLIR output"
+        );
+
+        println!("\n✓ i32 to bf16 conversion verified in MLIR output");
+    });
+}
+
+#[test]
+fn compile_int32_from_bf16() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "type_conversion_ops_module",
+            "int32_from_bf16_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== BF16 TO I32 MLIR ===\n{}", module_op_str);
+
+        assert!(
+            module_op_str.contains("= ftoi"),
+            "Expected ftoi operation in MLIR output"
+        );
+
+        println!("\n✓ bf16 to i32 conversion verified in MLIR output");
+    });
+}
+
+#[test]
+fn compile_bf16_from_f32() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "type_conversion_ops_module",
+            "bf16_from_f32_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== F32 TO BF16 MLIR ===\n{}", module_op_str);
+
+        assert!(
+            module_op_str.contains("= ftof"),
+            "Expected ftof operation in MLIR output"
+        );
+        assert!(
+            module_op_str.contains("bf16"),
+            "Expected bf16 type in MLIR output"
+        );
+
+        println!("\n✓ f32 to bf16 conversion verified in MLIR output");
+    });
+}
+
+#[test]
+fn compile_f32_from_bf16() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "type_conversion_ops_module",
+            "f32_from_bf16_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== BF16 TO F32 MLIR ===\n{}", module_op_str);
+
+        assert!(
+            module_op_str.contains("= ftof"),
+            "Expected ftof operation in MLIR output"
+        );
+
+        println!("\n✓ bf16 to f32 conversion verified in MLIR output");
+    });
+}
+
+#[test]
+fn compile_bf16_from_f64() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "type_conversion_ops_module",
+            "bf16_from_f64_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== F64 TO BF16 MLIR ===\n{}", module_op_str);
+
+        assert!(
+            module_op_str.contains("= ftof"),
+            "Expected ftof operation in MLIR output"
+        );
+        assert!(
+            module_op_str.contains("bf16"),
+            "Expected bf16 type in MLIR output"
+        );
+
+        println!("\n✓ f64 to bf16 conversion verified in MLIR output");
+    });
+}
+
+#[test]
+fn compile_f64_from_bf16() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "type_conversion_ops_module",
+            "f64_from_bf16_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== BF16 TO F64 MLIR ===\n{}", module_op_str);
+
+        assert!(
+            module_op_str.contains("= ftof"),
+            "Expected ftof operation in MLIR output"
+        );
+
+        println!("\n✓ bf16 to f64 conversion verified in MLIR output");
     });
 }

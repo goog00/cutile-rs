@@ -1467,7 +1467,7 @@ impl<'m, 'c> CUDATileFunctionCompiler<'m> {
         let region = Region::new();
         region.append_block(reduce_block);
 
-        let identity_val_str = if elem_ty_str.starts_with('f') {
+        let identity_val_str = if elem_ty_str.starts_with('f') || elem_ty_str.starts_with('b') {
             "0.0"
         } else {
             "0"
@@ -1601,7 +1601,7 @@ impl<'m, 'c> CUDATileFunctionCompiler<'m> {
             }
             result_value.value.unwrap()
         } else {
-            let add_op_name = if elem_ty_str.starts_with('f') {
+            let add_op_name = if elem_ty_str.starts_with('f') || elem_ty_str.starts_with('b') {
                 "cuda_tile.addf"
             } else {
                 "cuda_tile.addi"
@@ -1610,7 +1610,7 @@ impl<'m, 'c> CUDATileFunctionCompiler<'m> {
                 .add_results(&[elem_ty])
                 .add_operands(&[arg0, arg1]);
 
-            if elem_ty_str.starts_with('f') {
+            if elem_ty_str.starts_with('f') || elem_ty_str.starts_with('b') {
                 let rounding_attr =
                     self.parse_named_attr("rounding_mode", "#cuda_tile.rounding<nearest_even>")?;
                 add_op_builder = add_op_builder.add_attributes(&[rounding_attr]);
@@ -1630,7 +1630,7 @@ impl<'m, 'c> CUDATileFunctionCompiler<'m> {
         let region = Region::new();
         region.append_block(scan_block);
 
-        let identity_str = if elem_ty_str.starts_with('f') {
+        let identity_str = if elem_ty_str.starts_with('f') || elem_ty_str.starts_with('b') {
             "0.0"
         } else {
             "0"

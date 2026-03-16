@@ -36,6 +36,33 @@ mod binary_math_ops_module {
         let result: Tile<f32, S> = maxf(x, y);
         output.store(result);
     }
+
+    #[cutile::entry()]
+    fn bf16_arithmetic_kernel<const S: [i32; 1]>(output: &mut Tensor<bf16, S>) {
+        // Test bf16 arithmetic operations
+        let x: Tile<bf16, S> = load_tile_mut(output);
+        let y: Tile<bf16, S> = load_tile_mut(output);
+
+        let sum: Tile<bf16, S> = addf(x, y); // addition
+        let diff: Tile<bf16, S> = subf(sum, y); // subtraction
+        let prod: Tile<bf16, S> = mulf(diff, y); // multiplication
+        let result: Tile<bf16, S> = divf(prod, y); // division
+
+        output.store(result);
+    }
+
+    #[cutile::entry()]
+    fn bf16_comparison_kernel<const S: [i32; 1]>(output: &mut Tensor<bf16, S>) {
+        // Test bf16 comparison operations
+        let x: Tile<bf16, S> = load_tile_mut(output);
+        let y: Tile<bf16, S> = load_tile_mut(output);
+
+        let _eq: Tile<i1, S> = cmpf(x, "oeq", y); // equal
+        let _lt: Tile<i1, S> = cmpf(x, "olt", y); // less than
+        let _gt: Tile<i1, S> = cmpf(x, "ogt", y); // greater than
+
+        output.store(x);
+    }
 }
 
 use binary_math_ops_module::_module_asts;
@@ -108,5 +135,84 @@ fn compile_select() -> () {
         );
 
         println!("\n✓ select operation verified in MLIR output");
+    });
+}
+
+#[test]
+fn compile_bf16_arithmetic() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "binary_math_ops_module",
+            "bf16_arithmetic_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== BF16 ARITHMETIC MLIR ===\n{}", module_op_str);
+
+        let expected_ops = ["addf", "subf", "mulf", "divf"];
+        for op in expected_ops {
+            assert!(
+                module_op_str.contains(op),
+                "Expected {} operation in MLIR output",
+                op
+            );
+        }
+        assert!(
+            module_op_str.contains("bf16"),
+            "Expected bf16 type in MLIR output"
+        );
+
+        println!(
+            "\n✓ All {} bf16 arithmetic operations verified in MLIR output",
+            expected_ops.len()
+        );
+    });
+}
+
+#[test]
+fn compile_bf16_comparison() -> () {
+    common::with_test_stack(|| {
+        let modules =
+            CUDATileModules::new(_module_asts()).expect("Failed to create CUDATileModules");
+        let gpu_name = get_gpu_name(0);
+        let compiler = CUDATileFunctionCompiler::new(
+            &modules,
+            "binary_math_ops_module",
+            "bf16_comparison_kernel",
+            &[128.to_string()],
+            &[("output", &[1])],
+            None,
+            gpu_name,
+        )
+        .expect("Failed.");
+        let module_op_str = compiler
+            .compile()
+            .expect("Failed.")
+            .as_operation()
+            .to_string();
+        println!("\n=== BF16 COMPARISON MLIR ===\n{}", module_op_str);
+
+        assert!(
+            module_op_str.contains("cmpf"),
+            "Expected cmpf operation in MLIR output"
+        );
+        assert!(
+            module_op_str.contains("bf16"),
+            "Expected bf16 type in MLIR output"
+        );
+
+        println!("\n✓ bf16 comparison operations verified in MLIR output");
     });
 }
