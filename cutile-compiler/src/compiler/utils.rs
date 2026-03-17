@@ -13,7 +13,7 @@ use crate::generics::TypeInstance;
 use crate::syn_utils::{get_ident_from_expr, get_ident_from_path_expr};
 use crate::types::{get_cuda_tile_element_type_from_rust_primitive_str, MLIRVariadicArg};
 use half::f16;
-use half::bfloat16;
+use half::bf16 as bfloat16;
 use melior::ir::attribute::{IntegerAttribute, StringAttribute, TypeAttribute};
 use melior::ir::operation::OperationBuilder;
 use melior::ir::r#type::IntegerType;

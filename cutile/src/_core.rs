@@ -182,7 +182,7 @@
 pub mod core {
 
     pub use half::f16;
-    pub use half::bfloat16 as bf16;
+    pub use half::bf16;
     use std::marker::PhantomData;
     use std::ops;
 
