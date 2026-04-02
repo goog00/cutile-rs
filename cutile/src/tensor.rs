@@ -390,8 +390,9 @@ pub trait IntoPartitionArc {
 ///
 /// ## Memory Management
 ///
-/// Tensors own their GPU memory through a `DeviceBox`. Memory is automatically freed
-/// when the tensor is dropped. For shared ownership, use `Arc<Tensor<T>>`.
+/// Tensors share GPU memory ownership through `Arc<DeviceBox>`. Memory is automatically
+/// freed when the last reference is dropped. For shared tensor ownership, use
+/// `Arc<Tensor<T>>`, which enables zero-copy views over the same storage.
 ///
 /// ## Examples
 ///
@@ -428,13 +429,8 @@ pub trait IntoPartitionArc {
 /// let cpu_vec: Vec<f32> = gpu_tensor.to_host_vec().await;
 /// ```
 #[derive(Debug)]
-pub(crate) struct TensorStorage {
-    device_box: DeviceBox<[u8]>,
-}
-
-#[derive(Debug)]
 pub struct Tensor<T: DType> {
-    pub(crate) storage: Arc<TensorStorage>,
+    pub(crate) storage: Arc<DeviceBox>,
     pub shape: Vec<i32>,
     pub strides: Vec<i32>,
     _dtype: PhantomData<T>,
@@ -504,14 +500,14 @@ impl<T: DType> Tensor<T> {
 
     /// Wraps an owned byte allocation as a tensor after validating that the supplied
     /// shape/stride metadata is consistent with the allocation size.
-    pub(crate) fn from_storage_box(
-        device_box: DeviceBox<[u8]>,
+    pub(crate) fn from_device_box(
+        device_box: DeviceBox,
         shape: Vec<i32>,
         strides: Vec<i32>,
     ) -> Self {
         Self::assert_valid_metadata(&shape, &strides, device_box.len());
         Self {
-            storage: Arc::new(TensorStorage { device_box }),
+            storage: Arc::new(device_box),
             shape,
             strides,
             _dtype: PhantomData,
@@ -528,8 +524,8 @@ impl<T: DType> Tensor<T> {
         strides: Vec<i32>,
     ) -> Self {
         Self::assert_valid_metadata(&shape, &strides, len_bytes);
-        Self::from_storage_box(
-            DeviceBox::<[u8]>::from_raw_parts(dptr, len_bytes, device_id),
+        Self::from_device_box(
+            DeviceBox::from_raw_parts(dptr, len_bytes, device_id),
             shape,
             strides,
         )
@@ -537,7 +533,7 @@ impl<T: DType> Tensor<T> {
 
     // Returns the physical byte length of the shared backing allocation.
     fn storage_num_bytes(&self) -> usize {
-        self.storage.device_box.len()
+        self.storage.len()
     }
 
     // Returns the logical element count described by the tensor's shape metadata.
@@ -632,7 +628,7 @@ impl<T: DType> Tensor<T> {
     }
 
     pub fn cu_deviceptr(&self) -> CUdeviceptr {
-        self.storage.device_box.cu_deviceptr()
+        self.storage.cu_deviceptr()
     }
 
     /// Returns a typed device pointer.
@@ -1030,7 +1026,7 @@ mod tests {
             Tensor::<u8>::from_raw_parts(
                 base.cu_deviceptr() + 1,
                 4,
-                base.storage.device_box.device_id(),
+                base.storage.device_id(),
                 vec![4],
                 vec![1],
             )
@@ -1055,7 +1051,7 @@ mod tests {
             Tensor::<u32>::from_raw_parts(
                 base.cu_deviceptr(),
                 4,
-                base.storage.device_box.device_id(),
+                base.storage.device_id(),
                 vec![2],
                 vec![1],
             )
