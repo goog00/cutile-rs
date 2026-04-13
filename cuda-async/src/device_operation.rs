@@ -5,11 +5,11 @@
 
 //! Lazy, composable GPU operations and combinator types.
 
-use crate::device_context::with_default_device_policy;
+use crate::device_context::{pool_for_stream, with_default_device_policy};
 use crate::device_future::DeviceFuture;
 use crate::error::{device_error, DeviceError};
 use crate::scheduling_policies::SchedulingPolicy;
-use cuda_core::{Device, Stream};
+use cuda_core::{Device, Stream, MemPool};
 use std::cell::{Cell, UnsafeCell};
 use std::fmt::Debug;
 use std::future::IntoFuture;
@@ -61,16 +61,19 @@ pub struct ExecutionContext {
     ordinal: DeviceOrdinal,
     cuda_stream: Arc<Stream>,
     device: Arc<Device>,
+    pool: Option<Arc<MemPool>>,
 }
 
 impl ExecutionContext {
     pub fn new(cuda_stream: Arc<Stream>) -> Self {
         let device = cuda_stream.device().clone();
         let ordinal = device.ordinal();
+        let pool = pool_for_stream(&cuda_stream);
         Self {
             cuda_stream,
             device,
             ordinal,
+            pool,
         }
     }
     pub fn get_cuda_stream(&self) -> &Arc<Stream> {
@@ -81,6 +84,21 @@ impl ExecutionContext {
     }
     pub fn get_device_id(&self) -> DeviceOrdinal {
         self.ordinal
+    }
+    pub fn get_pool(&self) -> Option<&Arc<MemPool>> {
+        self.pool.as_ref()
+    }
+    /// Allocates device memory on this context's stream, using the custom pool if set.
+    ///
+    /// # Safety
+    /// The stream must be valid and not destroyed.
+    pub unsafe fn alloc_async(&self, num_bytes: usize) -> cuda_core::sys::CUdeviceptr {
+        match &self.pool {
+            Some(pool) => {
+                cuda_core::malloc_from_pool_async(num_bytes, pool, &self.cuda_stream)
+            }
+            None => cuda_core::malloc_async(num_bytes, &self.cuda_stream),
+        }
     }
     #[expect(
         dead_code,

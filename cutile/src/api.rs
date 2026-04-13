@@ -143,7 +143,7 @@ use cuda_async::error::DeviceError;
 use cuda_core::curand::{RandNormal, RandUniform, RNG};
 use cuda_core::sys::CUdeviceptr;
 use cuda_core::DType;
-use cuda_core::{malloc_async, memcpy_dtod_async, memcpy_dtoh_async, memcpy_htod_async};
+use cuda_core::{memcpy_dtod_async, memcpy_dtoh_async, memcpy_htod_async};
 use half::f16;
 use std::alloc::{alloc, Layout};
 use std::future::IntoFuture;
@@ -170,7 +170,7 @@ impl<T: DType> DeviceOp for CopyDeviceToDevice<T> {
         ctx: &ExecutionContext,
     ) -> Result<<Self as DeviceOp>::Output, DeviceError> {
         let num_bytes = self.num_elements * std::mem::size_of::<T>();
-        let dst = malloc_async(num_bytes, ctx.get_cuda_stream());
+        let dst = ctx.alloc_async(num_bytes);
         memcpy_dtod_async::<T>(dst, self.src_ptr, self.num_elements, ctx.get_cuda_stream());
         Ok(Tensor::from_raw_parts(
             dst,
@@ -392,7 +392,7 @@ impl<T: DType> DeviceOp for CopyHostVecToDevice<T> {
         let num_elements = vec.len();
         let shape = vec![num_elements as i32];
         let strides = vec![1];
-        let dptr = malloc_async(element_size * num_elements, ctx.get_cuda_stream());
+        let dptr = ctx.alloc_async(element_size * num_elements);
         memcpy_htod_async(dptr, vec.as_ptr(), num_elements, ctx.get_cuda_stream());
         Ok(Tensor::from_raw_parts(
             dptr,
