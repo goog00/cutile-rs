@@ -455,6 +455,76 @@ pub(crate) mod event {
     }
 }
 
+/// Low-level CUDA memory pool operations.
+pub(crate) mod pool {
+    use super::{DriverError, IntoResult};
+    use std::mem::MaybeUninit;
+
+    /// Creates a new memory pool with the given properties.
+    ///
+    /// # Safety
+    /// `props` must describe a valid pool configuration for an available device.
+    pub unsafe fn create(
+        props: &cuda_bindings::CUmemPoolProps,
+    ) -> Result<cuda_bindings::CUmemoryPool, DriverError> {
+        let mut pool = MaybeUninit::uninit();
+        cuda_bindings::cuMemPoolCreate(pool.as_mut_ptr(), props as *const _ as *mut _)
+            .result()?;
+        Ok(pool.assume_init())
+    }
+
+    /// Destroys a memory pool.
+    ///
+    /// # Safety
+    /// `pool` must be valid and all allocations from it must have been freed.
+    pub unsafe fn destroy(pool: cuda_bindings::CUmemoryPool) -> Result<(), DriverError> {
+        cuda_bindings::cuMemPoolDestroy(pool).result()
+    }
+
+    /// Returns the default memory pool for the given device.
+    ///
+    /// # Safety
+    /// `device` must be a valid device ordinal.
+    pub unsafe fn get_default(
+        device: cuda_bindings::CUdevice,
+    ) -> Result<cuda_bindings::CUmemoryPool, DriverError> {
+        let mut pool = MaybeUninit::uninit();
+        cuda_bindings::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), device).result()?;
+        Ok(pool.assume_init())
+    }
+
+    /// Sets the release threshold for a memory pool.
+    ///
+    /// # Safety
+    /// `pool` must be a valid pool handle.
+    pub unsafe fn set_release_threshold(
+        pool: cuda_bindings::CUmemoryPool,
+        threshold: u64,
+    ) -> Result<(), DriverError> {
+        cuda_bindings::cuMemPoolSetAttribute(
+            pool,
+            cuda_bindings::CUmemPool_attribute_enum_CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &threshold as *const _ as *mut _,
+        )
+        .result()
+    }
+
+    /// Allocates device memory from a specific pool asynchronously.
+    ///
+    /// # Safety
+    /// `pool` and `stream` must be valid handles.
+    pub unsafe fn malloc_from_pool_async(
+        pool: cuda_bindings::CUmemoryPool,
+        stream: cuda_bindings::CUstream,
+        num_bytes: usize,
+    ) -> Result<cuda_bindings::CUdeviceptr, DriverError> {
+        let mut dev_ptr = MaybeUninit::uninit();
+        cuda_bindings::cuMemAllocFromPoolAsync(dev_ptr.as_mut_ptr(), num_bytes, pool, stream)
+            .result()?;
+        Ok(dev_ptr.assume_init())
+    }
+}
+
 /// Low-level CUDA memory allocation, transfer, and management operations.
 #[allow(dead_code)]
 pub(crate) mod memory {

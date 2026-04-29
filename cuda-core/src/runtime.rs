@@ -12,7 +12,7 @@
 use std::ffi::{c_int, c_void, CString};
 use std::sync::Arc;
 
-use crate::cudarc_shim::{ctx, device, module, primary_ctx, stream};
+use crate::cudarc_shim::{ctx, device, module, pool, primary_ctx, stream};
 use crate::error::*;
 use crate::init;
 
@@ -197,6 +197,90 @@ impl Device {
             device: self.clone(),
             owned: true,
         }))
+    }
+
+    /// Creates a new memory pool on this device.
+    ///
+    /// The returned pool is owned — it will be destroyed when the last `Arc`
+    /// is dropped. Pair with [`MemPool::set_release_threshold`] to control
+    /// when the pool returns memory to the OS.
+    pub fn new_mem_pool(self: &Arc<Self>) -> Result<Arc<MemPool>, DriverError> {
+        self.bind_to_thread()?;
+        let mut props: cuda_bindings::CUmemPoolProps = unsafe { std::mem::zeroed() };
+        props.allocType = cuda_bindings::CUmemAllocationType_enum_CU_MEM_ALLOCATION_TYPE_PINNED;
+        props.handleTypes = cuda_bindings::CUmemAllocationHandleType_enum_CU_MEM_HANDLE_TYPE_NONE;
+        props.location.type_ = cuda_bindings::CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE;
+        props.location.__bindgen_anon_1.id = self.ordinal as c_int;
+        let cu_pool = unsafe { pool::create(&props) }?;
+        Ok(Arc::new(MemPool {
+            cu_pool,
+            device: self.clone(),
+            owned: true,
+        }))
+    }
+
+    /// Returns the driver-owned default memory pool for this device.
+    ///
+    /// The returned wrapper is **not owned** — dropping it does not destroy the
+    /// default pool, which is shared across all users of the device.
+    pub fn default_mem_pool(self: &Arc<Self>) -> Result<Arc<MemPool>, DriverError> {
+        self.bind_to_thread()?;
+        let cu_pool = unsafe { pool::get_default(self.cu_device) }?;
+        Ok(Arc::new(MemPool {
+            cu_pool,
+            device: self.clone(),
+            owned: false,
+        }))
+    }
+}
+
+/// A CUDA memory pool handle.
+///
+/// Can be either **owned** (created via [`Device::new_mem_pool`], destroyed on
+/// drop) or **borrowed** (created via [`Device::default_mem_pool`], does NOT
+/// destroy on drop).
+///
+/// Used by async tensor allocation via `cuMemAllocFromPoolAsync` when a pool
+/// is registered via `cuda_async::device_context::set_device_pool`.
+#[derive(Debug)]
+pub struct MemPool {
+    pub(crate) cu_pool: cuda_bindings::CUmemoryPool,
+    pub(crate) device: Arc<Device>,
+    owned: bool,
+}
+
+unsafe impl Send for MemPool {}
+unsafe impl Sync for MemPool {}
+
+impl Drop for MemPool {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        let _ = self.device.bind_to_thread();
+        let _ = unsafe { pool::destroy(self.cu_pool) };
+    }
+}
+
+impl MemPool {
+    /// Returns the raw `CUmemoryPool` handle.
+    pub fn cu_pool(&self) -> cuda_bindings::CUmemoryPool {
+        self.cu_pool
+    }
+
+    /// Returns a reference to the parent device.
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    /// Sets the release threshold for this pool.
+    ///
+    /// Memory held by the pool is not returned to the OS until pool usage drops
+    /// below this threshold. Use `u64::MAX` to prevent the OS from reclaiming
+    /// pool memory (useful for inference workloads with stable memory footprints).
+    pub fn set_release_threshold(&self, threshold: u64) -> Result<(), DriverError> {
+        self.device.bind_to_thread()?;
+        unsafe { pool::set_release_threshold(self.cu_pool, threshold) }
     }
 }
 
