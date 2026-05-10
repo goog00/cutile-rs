@@ -12,8 +12,9 @@
 //! starts clean.
 
 use cuda_async::device_context::{
-    clear_device_pool, get_device_pool, global_policy, init_device_contexts, set_device_pool,
-    with_device,
+    clear_device_pool, clear_device_poison, get_device_pool, global_policy, init_device_contexts,
+    is_device_poisoned, reset_device, set_device_pool, with_device, with_global_device_context,
+    with_global_device_context_mut,
 };
 use cuda_async::device_operation::{value, DeviceOp};
 use cuda_async::prelude::*;
@@ -369,6 +370,171 @@ fn switch_between_pools() {
             value(())
         });
         op_default.sync().expect("default op failed");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Re-entry detection (explicit-enum safety net)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn re_entry_to_with_global_device_context_panics() {
+    let result = std::thread::spawn(|| {
+        init_device_contexts(0, 1).expect("init failed (requires GPU)");
+        let _ = with_global_device_context(0, |_outer| {
+            // Re-entry from inside the callback should panic.
+            let _ = with_global_device_context(0, |_inner| {});
+        });
+    })
+    .join();
+
+    let payload = result.expect_err("expected re-entrant access to panic");
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .expect("panic payload should be a string");
+    assert!(
+        msg.contains("re-entrant access"),
+        "panic message should name re-entrancy, got: {msg}"
+    );
+}
+
+#[test]
+fn mut_callback_panic_returns_err_on_subsequent_access() {
+    on_fresh_thread(|| {
+        init_device_contexts(0, 1).expect("init failed (requires GPU)");
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_global_device_context_mut(0, |_ctx| {
+                panic!("simulated mutation failure for poisoning test");
+            });
+        }));
+        assert!(panic_result.is_err(), "test setup: expected inner panic");
+
+        assert!(
+            is_device_poisoned(0).expect("query failed"),
+            "device should be poisoned after a panicking _mut callback"
+        );
+
+        let read_err = with_global_device_context(0, |_| ())
+            .expect_err("read-only access to poisoned device should be Err");
+        match read_err {
+            cuda_async::error::DeviceError::Context { device_id, message } => {
+                assert_eq!(device_id, 0);
+                assert!(
+                    message.contains("poisoned"),
+                    "error message should name poisoning, got: {message}"
+                );
+            }
+            other => panic!("expected DeviceError::Context, got {other:?}"),
+        }
+
+        let mut_err = with_global_device_context_mut(0, |_| ())
+            .expect_err("_mut access to poisoned device should be Err");
+        assert!(matches!(
+            mut_err,
+            cuda_async::error::DeviceError::Context { device_id: 0, .. }
+        ));
+    });
+}
+
+#[test]
+fn clear_device_poison_recovers_existing_context() {
+    on_fresh_thread(|| {
+        init_device_contexts(0, 1).expect("init failed (requires GPU)");
+
+        let pool = with_device(0, |device| device.new_mem_pool())
+            .expect("get context failed")
+            .expect("pool creation failed");
+        let pool_ptr = pool.cu_pool();
+        set_device_pool(0, pool).expect("set pool failed");
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_global_device_context_mut(0, |_ctx| panic!("oops"));
+        }));
+        assert!(is_device_poisoned(0).expect("query failed"));
+
+        clear_device_poison(0).expect("clear failed");
+        assert!(!is_device_poisoned(0).expect("query failed"));
+
+        let pool = get_device_pool(0)
+            .expect("get pool failed")
+            .expect("pool should survive clear_device_poison");
+        assert_eq!(
+            pool.cu_pool(),
+            pool_ptr,
+            "clear_device_poison must not discard the existing context's state"
+        );
+    });
+}
+
+#[test]
+fn reset_device_drops_and_rebuilds_on_next_access() {
+    on_fresh_thread(|| {
+        init_device_contexts(0, 1).expect("init failed (requires GPU)");
+
+        let pool = with_device(0, |device| device.new_mem_pool())
+            .expect("get context failed")
+            .expect("pool creation failed");
+        set_device_pool(0, pool).expect("set pool failed");
+        assert!(get_device_pool(0).expect("get failed").is_some());
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_global_device_context_mut(0, |_ctx| panic!("oops"));
+        }));
+        assert!(is_device_poisoned(0).expect("query failed"));
+
+        reset_device(0).expect("reset failed");
+
+        assert!(!is_device_poisoned(0).expect("query failed"));
+        with_global_device_context(0, |_ctx| ())
+            .expect("read-only access after reset_device should succeed");
+        assert!(
+            get_device_pool(0).expect("get failed").is_none(),
+            "reset_device must drop the previously registered pool"
+        );
+    });
+}
+
+#[test]
+fn successful_mut_callback_does_not_poison() {
+    on_fresh_thread(|| {
+        init_device_contexts(0, 1).expect("init failed (requires GPU)");
+
+        with_global_device_context_mut(0, |_ctx| ()).expect("mut access failed");
+        assert!(
+            !is_device_poisoned(0).expect("query failed"),
+            "successful _mut callback must leave the device unpoisoned"
+        );
+    });
+}
+
+#[test]
+fn is_device_poisoned_returns_false_for_uninitialized_entry() {
+    on_fresh_thread(|| {
+        init_device_contexts(0, 1).expect("init failed (requires GPU)");
+
+        // Device 99 was never initialized: not poisoned, by definition.
+        assert!(!is_device_poisoned(99).expect("query failed"));
+    });
+}
+
+#[test]
+fn read_only_callback_panic_does_not_poison_context() {
+    on_fresh_thread(|| {
+        init_device_contexts(0, 1).expect("init failed (requires GPU)");
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_global_device_context(0, |_ctx| {
+                panic!("simulated panic in read-only callback");
+            });
+        }));
+        assert!(panic_result.is_err(), "test setup: expected inner panic");
+
+        // Subsequent read-only access should still succeed — no poisoning.
+        with_global_device_context(0, |_ctx| ())
+            .expect("read-only access after read-only panic should succeed");
     });
 }
 
