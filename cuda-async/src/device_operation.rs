@@ -65,17 +65,29 @@ pub struct ExecutionContext {
 }
 
 impl ExecutionContext {
+    /// Pure constructor. Pool defaults to `None`; chain
+    /// [`with_pool`](Self::with_pool) to attach one.
     pub fn new(cuda_stream: Arc<Stream>) -> Self {
         let device = cuda_stream.device().clone();
         let ordinal = device.ordinal();
-        let pool = pool_for_stream(&cuda_stream);
         Self {
             cuda_stream,
             device,
             ordinal,
-            pool,
+            pool: None,
         }
     }
+
+    /// Attach a memory pool. Callers fetch it via
+    /// [`pool_for_stream`](crate::device_context::pool_for_stream) outside any
+    /// `with_global_device_context*` callback (both borrow the same
+    /// thread-local map).
+    #[must_use]
+    pub fn with_pool(mut self, pool: Option<Arc<MemPool>>) -> Self {
+        self.pool = pool;
+        self
+    }
+
     pub fn get_cuda_stream(&self) -> &Arc<Stream> {
         &self.cuda_stream
     }
@@ -202,9 +214,10 @@ pub trait DeviceOp:
         policy: &Arc<dyn SchedulingPolicy>,
     ) -> Result<DeviceFuture<<Self as DeviceOp>::Output, Self>, DeviceError> {
         let stream = policy.next_stream()?;
+        let pool = pool_for_stream(&stream);
         let mut future = DeviceFuture::new();
         future.device_operation = Some(self);
-        future.execution_context = Some(ExecutionContext::new(stream));
+        future.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         Ok(future)
     }
     /// Chain a follow-up operation that runs **on the same stream** as `self`.
@@ -365,7 +378,8 @@ pub trait DeviceOp:
         self,
         stream: &Arc<Stream>,
     ) -> Result<<Self as DeviceOp>::Output, DeviceError> {
-        let ctx = ExecutionContext::new(stream.clone());
+        let pool = pool_for_stream(stream);
+        let ctx = ExecutionContext::new(stream.clone()).with_pool(pool);
         unsafe { self.execute(&ctx) }
     }
     /// Execute on an **explicit stream** and block until the GPU finishes.
@@ -375,7 +389,8 @@ pub trait DeviceOp:
     /// ordering or are debugging concurrency issues.
     fn sync_on(self, stream: &Arc<Stream>) -> Result<<Self as DeviceOp>::Output, DeviceError> {
         acquire_execution_lock()?;
-        let ctx = ExecutionContext::new(stream.clone());
+        let pool = pool_for_stream(stream);
+        let ctx = ExecutionContext::new(stream.clone()).with_pool(pool);
         let res = unsafe { self.execute(&ctx) };
         let sync_res = unsafe { stream.synchronize() };
         release_execution_lock();
@@ -437,7 +452,8 @@ impl<T: Send> IntoFuture for BoxedDeviceOp<T> {
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -502,7 +518,8 @@ impl<T: Send + Sync> IntoFuture for SharedDeviceOp<T> {
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -663,7 +680,8 @@ where
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -702,7 +720,8 @@ impl<T: Send> IntoFuture for Value<T> {
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -760,7 +779,8 @@ impl<O: Send, DO: DeviceOp<Output = O>, F: FnOnce() -> DO> IntoFuture for Empty<
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -816,7 +836,8 @@ impl<T1: Send, T2: Send, A: DeviceOp<Output = T1>, B: DeviceOp<Output = T2>> Int
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -1029,7 +1050,8 @@ where
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -1073,7 +1095,8 @@ where
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -1340,7 +1363,8 @@ impl<O: Send, DO: DeviceOp<Output = O>, F: FnOnce(&ExecutionContext) -> DO + Sen
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -1398,7 +1422,8 @@ where
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }
@@ -1464,7 +1489,8 @@ impl<T: Send> IntoFuture for DeviceOpVec<T> {
         };
         let mut f = DeviceFuture::new();
         f.device_operation = Some(self);
-        f.execution_context = Some(ExecutionContext::new(stream));
+        let pool = pool_for_stream(&stream);
+        f.execution_context = Some(ExecutionContext::new(stream).with_pool(pool));
         f
     }
 }

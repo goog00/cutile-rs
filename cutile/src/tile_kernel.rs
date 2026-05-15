@@ -731,14 +731,12 @@ where
     type Output = Result<Partition<I>, DeviceError>;
     type IntoFuture = DeviceFuture<Partition<I>, DeviceOperationPartition<RANK, I, DI>>;
     fn into_future(self) -> Self::IntoFuture {
-        match with_default_device_policy(|policy| {
-            let stream = policy.next_stream()?;
-            Ok(DeviceFuture::scheduled(self, ExecutionContext::new(stream)))
-        }) {
-            Ok(Ok(future)) => future,
-            Ok(Err(e)) => DeviceFuture::failed(e),
-            Err(e) => DeviceFuture::failed(e),
-        }
+        let stream = match with_default_device_policy(|policy| policy.next_stream()) {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
+        };
+        let pool = pool_for_stream(&stream);
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -796,14 +794,12 @@ where
     type Output = Result<I, DeviceError>;
     type IntoFuture = DeviceFuture<I, UnwrapPartition<I, DI>>;
     fn into_future(self) -> Self::IntoFuture {
-        match with_default_device_policy(|policy| {
-            let stream = policy.next_stream()?;
-            Ok(DeviceFuture::scheduled(self, ExecutionContext::new(stream)))
-        }) {
-            Ok(Ok(future)) => future,
-            Ok(Err(e)) => DeviceFuture::failed(e),
-            Err(e) => DeviceFuture::failed(e),
-        }
+        let stream = match with_default_device_policy(|policy| policy.next_stream()) {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
+        };
+        let pool = pool_for_stream(&stream);
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -872,14 +868,12 @@ where
     type Output = Result<Vec<T>, DeviceError>;
     type IntoFuture = DeviceFuture<Vec<T>, TensorToHostVec<T, DI>>;
     fn into_future(self) -> Self::IntoFuture {
-        match with_default_device_policy(|policy| {
-            let stream = policy.next_stream()?;
-            Ok(DeviceFuture::scheduled(self, ExecutionContext::new(stream)))
-        }) {
-            Ok(Ok(future)) => future,
-            Ok(Err(e)) => DeviceFuture::failed(e),
-            Err(e) => DeviceFuture::failed(e),
-        }
+        let stream = match with_default_device_policy(|policy| policy.next_stream()) {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
+        };
+        let pool = pool_for_stream(&stream);
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
