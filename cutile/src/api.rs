@@ -135,7 +135,7 @@ use crate::kernels::conversion::convert_apply;
 use crate::kernels::creation::{arange_apply, eye_apply, full_apply, linspace as linspace_kernel};
 use crate::tensor::{IntoPartition, Reshape, Tensor, Unpartition};
 use cuda_async::device_buffer::DeviceBuffer;
-use cuda_async::device_context::with_default_device_policy;
+use cuda_async::device_context::{pool_for_stream, with_default_device_policy};
 use cuda_async::device_future::DeviceFuture;
 use cuda_async::device_operation::{value, DeviceOp, ExecutionContext, Unzippable1, Unzippable2};
 use cuda_async::error::DeviceError;
@@ -189,7 +189,11 @@ impl<T: DType> IntoFuture for CopyDeviceToDevice<T> {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -301,7 +305,11 @@ impl IntoFuture for Memcpy {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -341,7 +349,11 @@ impl<T: DType> IntoFuture for CopyDeviceToHostVec<T> {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -402,7 +414,11 @@ impl<T: DType> IntoFuture for CopyHostVecToDevice<T> {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -710,7 +726,11 @@ impl<T: DType, DI: DeviceOp<Output = Tensor<T>>> IntoFuture for ReshapeOp<Tensor
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -737,7 +757,11 @@ impl<T: DType + Send, DI: DeviceOp<Output = Arc<Tensor<T>>>> IntoFuture
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 

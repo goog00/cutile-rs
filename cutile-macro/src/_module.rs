@@ -851,7 +851,11 @@ pub fn kernel_launcher(
                     Ok(Ok(stream)) => stream,
                     Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
                 };
-                DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+                let pool = match pool_for_stream(&stream) {
+                    Ok(pool) => pool,
+                    Err(e) => return DeviceFuture::failed(e),
+                };
+                DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
             }
         }
 

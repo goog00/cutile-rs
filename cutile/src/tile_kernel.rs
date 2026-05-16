@@ -188,7 +188,7 @@ pub fn compile_from_context<F: Fn() -> Module>(
         compile_options,
     );
     let cache_hash_str = key.get_hash_string();
-    if contains_cuda_function(device_id, &key) {
+    if contains_cuda_function(device_id, &key)? {
         // A hit to the thread local kernel cache returns the compiled function.
         let func = get_cuda_function(device_id, &key)?;
         let validator = get_function_validator(device_id, &key)?;
@@ -735,7 +735,11 @@ where
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -797,7 +801,11 @@ where
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 
@@ -870,7 +878,11 @@ where
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) | Err(e) => return DeviceFuture::failed(e),
         };
-        DeviceFuture::scheduled(self, ExecutionContext::new(stream))
+        let pool = match pool_for_stream(&stream) {
+            Ok(pool) => pool,
+            Err(e) => return DeviceFuture::failed(e),
+        };
+        DeviceFuture::scheduled(self, ExecutionContext::new(stream).with_pool(pool))
     }
 }
 

@@ -353,8 +353,8 @@ pub fn reset_device(device_id: usize) -> Result<(), DeviceError> {
 ///
 /// Nested access is unsupported: re-borrowing the per-thread map from
 /// within `f` — directly or transitively (`pool_for_stream`,
-/// `contains_cuda_function`, `ExecutionContext::new`, the recovery fns) —
-/// panics on `Borrowed`. Intentional and guaranteed; see [`borrow_devices`].
+/// `contains_cuda_function`, the recovery fns) — panics on `Borrowed`.
+/// Intentional and guaranteed; see [`borrow_devices`].
 ///
 /// Returns `Err(DeviceError::Context)` if `device_id` is poisoned; recover
 /// via [`clear_device_poison`] / [`reset_device`].
@@ -539,12 +539,13 @@ pub fn get_device_pool(device_id: usize) -> Result<Option<Arc<MemPool>>, DeviceE
     with_global_device_context(device_id, |device_context| device_context.pool.clone())
 }
 
-/// Resolve the custom memory pool associated with the device that owns `stream`.
+/// Custom pool registered for `stream`'s device, if any.
 ///
-/// Errors from the device-context lookup are downgraded to `None`; this is the
-/// single choke-point for that decision so callers don't each re-derive it.
-pub fn pool_for_stream(stream: &Arc<Stream>) -> Option<Arc<MemPool>> {
-    get_device_pool(stream.device().ordinal()).ok().flatten()
+/// Propagates context errors (poison etc.) rather than downgrading to
+/// `None`. Re-borrows the per-thread map — not callable from inside a
+/// `with_global_device_context*` callback.
+pub fn pool_for_stream(stream: &Arc<Stream>) -> Result<Option<Arc<MemPool>>, DeviceError> {
+    get_device_pool(stream.device().ordinal())
 }
 
 /// Run a closure with the scheduling policy of the current thread's default device.
@@ -594,12 +595,17 @@ pub fn insert_cuda_function(
 }
 
 /// Check whether a kernel with the given key has already been compiled and cached.
-pub fn contains_cuda_function(device_id: usize, func_key: &impl FunctionKey) -> bool {
+///
+/// Propagates context errors (poisoned device, etc.) instead of downgrading
+/// them to `false` — masking the poison would trigger a redundant recompile.
+pub fn contains_cuda_function(
+    device_id: usize,
+    func_key: &impl FunctionKey,
+) -> Result<bool, DeviceError> {
     with_global_device_context(device_id, |device_context| {
         let key = func_key.get_hash_string();
         device_context.functions.contains_key(&key)
     })
-    .is_ok_and(|pred| pred)
 }
 
 /// Retrieve a previously compiled kernel from the cache.
