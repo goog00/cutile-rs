@@ -43,6 +43,10 @@ run_step \
     "cutile GPU aggregate tests" \
     cargo test -p cutile --test gpu
 
+run_step \
+    "cutile JIT disk-cache integration test" \
+    cargo test -p cutile --test jit_disk_cache
+
 for test_target in \
     concurrent_capture \
     cuda_graph \

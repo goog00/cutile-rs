@@ -467,9 +467,9 @@ dependencies = [
  "half",
  "linkme",
  "num-traits",
- "once_cell",
  "proc-macro2",
  "quote",
+ "sha2",
  "syn",
  "tokio",
 ]

@@ -49,6 +49,12 @@ pub trait FunctionKey: Hash {
         let hash_value: u64 = hasher.finish();
         format!("{:x}", hash_value)
     }
+
+    /// SHA-256 key for disk persistence. Override this to hash a canonical
+    /// string of all key fields; the default delegates to [`get_hash_string`](Self::get_hash_string).
+    fn get_disk_hash_string(&self) -> String {
+        self.get_hash_string()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -477,6 +483,14 @@ where
 pub fn load_module_from_file(filename: &str, device_id: usize) -> Result<Arc<Module>, DeviceError> {
     with_device(device_id, |device| {
         let module = device.load_module_from_file(filename)?;
+        Ok(module)
+    })?
+}
+
+/// Load a CUDA module from in-memory cubin bytes.
+pub fn load_module_from_bytes(data: &[u8], device_id: usize) -> Result<Arc<Module>, DeviceError> {
+    with_device(device_id, |device| {
+        let module = device.load_module_from_data(data)?;
         Ok(module)
     })?
 }
