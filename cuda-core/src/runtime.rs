@@ -199,6 +199,21 @@ impl Device {
         }))
     }
 
+    /// Loads a CUDA module directly from an in-memory cubin (or null-terminated
+    /// PTX) image, via `cuModuleLoadData`.
+    pub fn load_module_from_data(
+        self: &Arc<Self>,
+        data: &[u8],
+    ) -> Result<Arc<Module>, DriverError> {
+        self.bind_to_thread()?;
+        let cu_module = unsafe { module::load_data(data.as_ptr() as *const _) }?;
+        Ok(Arc::new(Module {
+            cu_module,
+            device: self.clone(),
+            owned: true,
+        }))
+    }
+
     /// Creates a new memory pool on this device.
     ///
     /// The returned pool is owned — it will be destroyed when the last `Arc`

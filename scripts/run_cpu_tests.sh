@@ -41,6 +41,10 @@ run_step \
     "cutile warmup/cache-key CPU tests" \
     cargo test -p cutile --test warmup
 
+run_step \
+    "cuda-async jit_store CPU tests" \
+    cargo test -p cuda-async --test jit_store
+
 print_summary_and_exit \
     "All CPU tests passed!" \
     "Some CPU checks failed. See output above for details."

@@ -13,6 +13,7 @@ use cutile_compiler::ast::Module;
 use cutile_compiler::compiler::{CUDATileFunctionCompiler, CUDATileModules};
 use cutile_compiler::cuda_tile_runtime_utils::{compile_tile_ir_module, get_gpu_name, get_cuda_toolkit_version, get_compiler_version};
 use cutile_compiler::specialization::{DivHint, SpecializationBits};
+use sha2::{Digest, Sha256};
 use std::alloc::{alloc, Layout};
 use std::fs;
 use std::future::IntoFuture;
@@ -46,6 +47,21 @@ pub fn jit_compile_count() -> u64 {
 #[inline]
 fn record_jit_compile() {
     JIT_COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+static JIT_DISK_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Process-global disk-cache hit counter: +1 each time a kernel is served from
+/// the [`JitStore`](cuda_async::jit_store::JitStore) instead of being compiled.
+/// A disk hit never increments [`jit_compile_count`], so tests can assert cache
+/// behavior on exact counts rather than wall-clock timing.
+pub fn jit_disk_hit_count() -> u64 {
+    JIT_DISK_HIT_COUNT.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn record_disk_hit() {
+    JIT_DISK_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 use crate::error::*;
@@ -224,7 +240,42 @@ impl TileFunctionKey {
     }
 }
 
-impl FunctionKey for TileFunctionKey {}
+impl FunctionKey for TileFunctionKey {
+    /// SHA-256 over a canonical string of every key field. Mirrors the field set
+    /// hashed by the derived `Hash` impl (used for the in-memory key) so a disk
+    /// hit can never return a cubin compiled for a different specialization.
+    fn get_disk_hash_string(&self) -> String {
+        let canonical = format!(
+            "{}:{}:{}:{}:{}:{}:{:?}:{:?}:{}:{}:{}:{}",
+            self.module_name,
+            self.function_name,
+            self.function_generics.join(","),
+            self.stride_args
+                .iter()
+                .map(|(k, v)| format!("{}={:?}", k, v))
+                .collect::<Vec<_>>()
+                .join(";"),
+            self.spec_args
+                .iter()
+                .map(|(k, v)| format!("{}={:?}", k, v))
+                .collect::<Vec<_>>()
+                .join(";"),
+            self.scalar_hints
+                .iter()
+                .map(|(k, v)| format!("{}={:?}", k, v))
+                .collect::<Vec<_>>()
+                .join(";"),
+            self.grid,
+            self.compile_options,
+            self.source_hash,
+            self.gpu_name,
+            self.compiler_version,
+            self.cuda_toolkit_version,
+        );
+        let hash = Sha256::digest(canonical.as_bytes());
+        format!("{:x}", hash)
+    }
+}
 
 /// Reads IR (MLIR or PTX) from a file.
 ///
@@ -354,11 +405,88 @@ pub fn compile_from_context<F: Fn() -> Module>(
         cuda_toolkit_version,
     );
     let key_str = key.get_hash_string();
+    let disk_key = key.get_disk_hash_string();
     let slot = kernel_cache_slot(&key_str);
 
     // Use OnceCell::get_or_try_init for single-flight compilation dedup.
     // Only one thread executes the closure; others block and see the result.
     let compiled = slot.get_or_try_init(|| -> Result<CompiledKernel, Error> {
+        // Disk cache: only consulted when a JitStore has been explicitly
+        // installed via `set_jit_store`. A hit still rebuilds the compiler
+        // front-end (the Validator is not persisted) but skips the `tileiras`
+        // compile step by loading the cached cubin bytes directly.
+        if let Some(store) = cuda_async::jit_store::get_jit_store() {
+            if let Some(cubin_bytes) = store.get(&disk_key).ok().flatten() {
+                jit_log!(
+                    "{module_name}::{function_name} → disk cache hit ({} bytes)",
+                    cubin_bytes.len()
+                );
+                let modules = CUDATileModules::from_kernel(kernel_ast())?;
+                let stride_args_refs: Vec<(&str, &[i32])> = key
+                    .stride_args
+                    .iter()
+                    .map(|x| (x.0.as_str(), x.1.as_slice()))
+                    .collect();
+                let spec_args_refs: Vec<(&str, &SpecializationBits)> = key
+                    .spec_args
+                    .iter()
+                    .map(|x| (x.0.as_str(), &x.1))
+                    .collect();
+                let scalar_hints_refs: Vec<(&str, &DivHint)> = key
+                    .scalar_hints
+                    .iter()
+                    .map(|x| (x.0.as_str(), &x.1))
+                    .collect();
+                let compiler = CUDATileFunctionCompiler::new(
+                    &modules,
+                    module_name,
+                    function_name,
+                    &key.function_generics,
+                    &stride_args_refs,
+                    &spec_args_refs,
+                    &scalar_hints_refs,
+                    const_grid,
+                    gpu_name.clone(),
+                    &key.compile_options,
+                )?;
+                let validator = Arc::new(compiler.get_validator());
+                match load_module_from_bytes(&cubin_bytes, device_id) {
+                    Ok(module) => match module.load_function(function_entry) {
+                        Ok(function) => {
+                            record_disk_hit();
+                            return Ok(CompiledKernel {
+                                module,
+                                function: Arc::new(function),
+                                validator,
+                            });
+                        }
+                        Err(e) => {
+                            // Module loaded but the expected symbol is missing
+                            // (hash collision, truncated cubin, …). Treat as a
+                            // bad cache entry: delete and fall through to a
+                            // full recompile.
+                            jit_log!(
+                                "{module_name}::{function_name} → cached cubin missing \
+                                 symbol '{function_entry}', deleting and recompiling \
+                                 (error: {e})"
+                            );
+                            let _ = store.delete(&disk_key);
+                        }
+                    },
+                    Err(e) => {
+                        // Corrupted/incompatible cubin (partial write, arch
+                        // mismatch, …). Drop the bad entry and fall through to a
+                        // full recompile so the caller is never permanently stuck.
+                        jit_log!(
+                            "{module_name}::{function_name} → corrupted disk cubin, \
+                             deleting and recompiling (error: {e})"
+                        );
+                        let _ = store.delete(&disk_key);
+                    }
+                }
+            }
+        }
+
         // Cache miss: this closure runs exactly once per key, only on a real
         // compile. Record it so tests can assert hit/miss deterministically.
         record_jit_compile();
@@ -496,6 +624,25 @@ pub fn compile_from_context<F: Fn() -> Module>(
                 key.function_generics.join(","),
             );
         }
+        // Persist the freshly compiled cubin so future processes can skip
+        // codegen. Only the cubin is stored; the Validator is rebuilt on hit.
+        if let Some(store) = cuda_async::jit_store::get_jit_store() {
+            match fs::read(&cubin_filename) {
+                Ok(cubin_bytes) => {
+                    if store.put(&disk_key, &cubin_bytes).is_ok() {
+                        jit_log!(
+                            "{module_name}::{function_name} → saved to disk cache ({} bytes)",
+                            cubin_bytes.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    jit_log!(
+                        "{module_name}::{function_name} → could not read cubin to persist: {e}"
+                    );
+                }
+            }
+        }
         Ok(CompiledKernel {
             module,
             function,
@@ -632,23 +779,20 @@ pub fn compile_warmup<F: Fn() -> Module>(
             cuda_toolkit_version.clone(),
         );
 
+        let disk_key = key.get_disk_hash_string();
         let slot = kernel_cache_slot(&key.get_hash_string());
 
         // Use OnceCell::get_or_try_init for single-flight compilation dedup.
         // Only one thread executes the closure; others block and see the result.
         let _ = slot.get_or_try_init(|| -> Result<CompiledKernel, Error> {
-            // Cache miss: this closure runs exactly once per key, only on a
-            // real compile. Record it so tests can assert hit/miss
-            // deterministically.
-            record_jit_compile();
             jit_log!(
                 "warmup: {module_name}::{} <{}> → compiling...",
                 spec.function_name,
                 spec.function_generics.join(", ")
             );
-
-            // Full JIT compilation.
             let t0 = std::time::Instant::now();
+            // The compiler front-end is built on both the disk-hit and the
+            // compile path because the Validator is never persisted.
             let compiler = CUDATileFunctionCompiler::new(
                 &modules,
                 module_name,
@@ -674,6 +818,49 @@ pub fn compile_warmup<F: Fn() -> Module>(
                 &key.compile_options,
             )?;
             let validator = Arc::new(compiler.get_validator());
+
+            // Disk cache hit: skip codegen, load the cached cubin directly.
+            if let Some(store) = cuda_async::jit_store::get_jit_store() {
+                if let Some(cubin_bytes) = store.get(&disk_key).ok().flatten() {
+                    match load_module_from_bytes(&cubin_bytes, device_id) {
+                        Ok(module) => match module.load_function(entry.function_entry) {
+                            Ok(function) => {
+                                record_disk_hit();
+                                jit_log!(
+                                    "warmup: {module_name}::{} → disk cache hit ({} bytes)",
+                                    spec.function_name,
+                                    cubin_bytes.len()
+                                );
+                                return Ok(CompiledKernel {
+                                    module,
+                                    function: Arc::new(function),
+                                    validator: Arc::clone(&validator),
+                                });
+                            }
+                            Err(e) => {
+                                jit_log!(
+                                    "warmup: {module_name}::{} → cached cubin missing \
+                                     symbol '{}', deleting and recompiling (error: {e})",
+                                    spec.function_name,
+                                    entry.function_entry
+                                );
+                                let _ = store.delete(&disk_key);
+                            }
+                        },
+                        Err(e) => {
+                            jit_log!(
+                                "warmup: {module_name}::{} → corrupted disk cubin, \
+                                 deleting and recompiling (error: {e})",
+                                spec.function_name
+                            );
+                            let _ = store.delete(&disk_key);
+                        }
+                    }
+                }
+            }
+
+            // Cache miss: run the full codegen pipeline.
+            record_jit_compile();
             let module_op = compiler.compile()?;
             let cubin_filename = compile_tile_ir_module(&module_op, &gpu_name);
             let jit_elapsed = t0.elapsed();
@@ -691,6 +878,11 @@ pub fn compile_warmup<F: Fn() -> Module>(
                 spec.function_name,
                 jit_elapsed
             );
+            if let Some(store) = cuda_async::jit_store::get_jit_store() {
+                if let Ok(cubin_bytes) = fs::read(&cubin_filename) {
+                    let _ = store.put(&disk_key, &cubin_bytes);
+                }
+            }
             Ok(CompiledKernel {
                 module,
                 function,

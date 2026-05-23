@@ -27,3 +27,4 @@ cutile-macro = { workspace = true }
 cutile-ir = { workspace = true }
 linkme = { workspace = true }
 once_cell = { workspace = true }
+sha2 = { workspace = true }

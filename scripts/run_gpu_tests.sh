@@ -45,6 +45,10 @@ run_step \
     "cutile GPU error-quality tests" \
     cargo test -p cutile --test gpu
 
+run_step \
+    "cutile JIT disk-cache integration test" \
+    cargo test -p cutile --test jit_disk_cache
+
 for test_target in \
     pool_allocation
 do
