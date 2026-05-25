@@ -3,14 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! GPU integration tests for compile_warmup.
+//! GPU integration tests for compile_warmup and execute_warmup.
 
 use crate::common;
 use cutile::api;
 use cutile::prelude::{DeviceOp, PartitionOp};
 use cutile::tile_kernel::{
-    contains_cuda_function, get_default_device, jit_compile_count,
-    TileFunctionKey, TileKernel, WarmupSpec,
+    clear_kernel_cache, contains_cuda_function, get_default_device, jit_compile_count,
+    LaunchHook, TileFunctionKey, TileKernel, WarmupCtx, WarmupSpec,
 };
 use cutile_compiler::cuda_tile_runtime_utils::{
     get_compiler_version, get_cuda_toolkit_version, get_gpu_name,
@@ -336,6 +336,172 @@ fn multi_thread_dedup_timing_evidence() {
             compiles_during_race, 1,
             "single-flight dedup: 4 concurrent threads on the same fresh kernel \
              must trigger exactly ONE JIT compile, got {compiles_during_race}"
+        );
+    });
+}
+
+// ============================================================================
+// execute_warmup tests
+// ============================================================================
+
+// Convenience: build a launch hook for vector_add with the given tile size.
+fn vector_add_hook(tile: i32) -> LaunchHook {
+    LaunchHook::new("vector_add", move |_| {
+        let x = api::ones::<f32>(&[256]).sync()?;
+        let y = api::ones::<f32>(&[256]).sync()?;
+        let z = api::zeros::<f32>(&[256])
+            .partition([tile as usize])
+            .sync()?;
+        let _ = warmup_test_module::vector_add(z, &x, &y)
+            .generics(vec!["f32".into(), tile.to_string()])
+            .sync()?;
+        Ok(())
+    })
+}
+
+#[test]
+fn execute_warmup_runs_all_hooks() {
+    common::with_test_stack(|| {
+        let _guard = common::cache_test_lock();
+        let report = warmup_test_module::_execute_warmup(vec![
+            vector_add_hook(64),
+            vector_add_hook(128),
+        ])
+        .expect("device init must succeed");
+
+        assert_eq!(report.outcomes.len(), 2);
+        assert!(report.all_ok(), "all hooks must succeed: {:?}", report);
+        assert_eq!(report.ok_count(), 2);
+        assert_eq!(report.err_count(), 0);
+    });
+}
+
+#[test]
+fn execute_warmup_continues_after_failure() {
+    common::with_test_stack(|| {
+        let _guard = common::cache_test_lock();
+        let err_hook = LaunchHook::new(
+            "vector_add",
+            |_: &WarmupCtx| -> Result<(), cutile::error::Error> {
+                Err(cutile::error::Error::KernelLaunch(
+                    cutile::error::KernelLaunchError("simulated hook failure".into()),
+                ))
+            },
+        );
+        let report = warmup_test_module::_execute_warmup(vec![
+            vector_add_hook(64),
+            err_hook,
+            vector_add_hook(128),
+        ])
+        .expect("device init must succeed");
+
+        assert_eq!(report.outcomes.len(), 3);
+        assert!(report.outcomes[0].result.is_ok());
+        assert!(report.outcomes[1].result.is_err());
+        assert!(
+            report.outcomes[2].result.is_ok(),
+            "third hook must still run after second returned Err (failure isolation)"
+        );
+    });
+}
+
+#[test]
+fn execute_warmup_catches_panic() {
+    common::with_test_stack(|| {
+        let _guard = common::cache_test_lock();
+        let panic_hook = LaunchHook::new(
+            "vector_add",
+            |_: &WarmupCtx| -> Result<(), cutile::error::Error> {
+                panic!("simulated panic in warmup hook");
+            },
+        );
+        let report = warmup_test_module::_execute_warmup(vec![panic_hook, vector_add_hook(64)])
+            .expect("device init must succeed");
+
+        assert_eq!(report.outcomes.len(), 2);
+        assert!(
+            report.outcomes[0].result.is_err(),
+            "panicking hook must be reported as Err"
+        );
+        assert!(
+            report.outcomes[1].result.is_ok(),
+            "hook after panic must still run"
+        );
+    });
+}
+
+#[test]
+fn execute_warmup_unknown_function_isolated() {
+    common::with_test_stack(|| {
+        let _guard = common::cache_test_lock();
+        let bad_hook = LaunchHook::new(
+            "nonexistent_kernel",
+            |_: &WarmupCtx| -> Result<(), cutile::error::Error> {
+                panic!("hook for unknown function must not be invoked");
+            },
+        );
+        let report = warmup_test_module::_execute_warmup(vec![bad_hook, vector_add_hook(64)])
+            .expect("device init must succeed");
+
+        assert_eq!(report.outcomes.len(), 2);
+        assert!(report.outcomes[0].result.is_err());
+        assert_eq!(
+            report.outcomes[0].jit_compiles, 0,
+            "rejected hook must not have run JIT"
+        );
+        assert!(
+            report.outcomes[1].result.is_ok(),
+            "valid hook must still run after unknown-function hook was rejected"
+        );
+    });
+}
+
+#[test]
+fn execute_warmup_after_compile_warmup_no_recompile() {
+    common::with_test_stack(|| {
+        let _guard = common::cache_test_lock();
+
+        clear_kernel_cache();
+
+        let spec_args = vector_add_spec_args(256, 64);
+
+        warmup_test_module::_compile_warmup(&[WarmupSpec::new(
+            "vector_add",
+            vec!["f32".into(), "64".into()],
+        )
+        .with_strides(vector_add_stride_args())
+        .with_spec_args(spec_args.clone())])
+        .expect("compile_warmup failed");
+
+        let c_before = jit_compile_count();
+        let report = warmup_test_module::_execute_warmup(vec![vector_add_hook(64)])
+            .expect("device init must succeed");
+        let c_after = jit_compile_count();
+
+        assert!(report.all_ok(), "hook must succeed: {:?}", report);
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            report.outcomes[0].jit_compiles, 0,
+            "execute_warmup after compile_warmup with same key must NOT recompile \
+             — counter delta means warmup and launch keys disagree"
+        );
+        assert_eq!(
+            c_after, c_before,
+            "global counter must not move either"
+        );
+    });
+}
+
+#[test]
+fn execute_warmup_timing_recorded() {
+    common::with_test_stack(|| {
+        let _guard = common::cache_test_lock();
+        let report = warmup_test_module::_execute_warmup(vec![vector_add_hook(64)])
+            .expect("device init must succeed");
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(
+            report.outcomes[0].elapsed > std::time::Duration::ZERO,
+            "elapsed must be recorded"
         );
     });
 }

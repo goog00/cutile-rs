@@ -710,6 +710,165 @@ pub fn compile_warmup<F: Fn() -> Module>(
     Ok(())
 }
 
+// ── execute_warmup: per-kernel launch hooks ──────────────────────────────────
+
+/// Per-kernel launch hook for [`execute_warmup`].
+///
+/// `function_name` must match a `#[cutile::entry]` function in the module.
+/// The `launch` closure receives a [`WarmupCtx`] and is expected to perform
+/// the actual GPU launch with realistic tensors, so runtime side effects
+/// (shared-memory pool, occupancy decisions, driver lazy-init paths) get
+/// paid up front rather than on the first production request.
+pub struct LaunchHook {
+    pub function_name: String,
+    pub launch: Box<dyn FnOnce(&WarmupCtx) -> Result<(), Error> + Send>,
+}
+
+impl LaunchHook {
+    /// Create a hook for the given kernel.
+    pub fn new<F>(function_name: &str, launch: F) -> Self
+    where
+        F: FnOnce(&WarmupCtx) -> Result<(), Error> + Send + 'static,
+    {
+        Self {
+            function_name: function_name.to_string(),
+            launch: Box::new(launch),
+        }
+    }
+}
+
+/// Context passed to each launch hook. Currently only carries the active
+/// device id; marked `non_exhaustive` so new fields don't break callers.
+#[non_exhaustive]
+pub struct WarmupCtx {
+    pub device_id: usize,
+}
+
+/// Outcome of a single launch hook.
+#[derive(Debug)]
+pub struct HookOutcome {
+    pub function_name: String,
+    pub result: Result<(), Error>,
+    pub elapsed: std::time::Duration,
+    /// Should be 0 after a matching [`compile_warmup`]; nonzero means key mismatch.
+    pub jit_compiles: u64,
+}
+
+/// Aggregate report returned by [`execute_warmup`].
+///
+/// `execute_warmup` is failure-isolated by default: every hook gets a
+/// chance to run, and failures are recorded in `outcomes` rather than
+/// short-circuiting. Use [`WarmupReport::all_ok`] / [`WarmupReport::err_count`]
+/// to gate on success.
+#[derive(Debug, Default)]
+pub struct WarmupReport {
+    pub outcomes: Vec<HookOutcome>,
+}
+
+impl WarmupReport {
+    /// Number of hooks that returned `Ok(())`.
+    pub fn ok_count(&self) -> usize {
+        self.outcomes.iter().filter(|o| o.result.is_ok()).count()
+    }
+    /// Number of hooks that returned `Err(_)` (including panics).
+    pub fn err_count(&self) -> usize {
+        self.outcomes.iter().filter(|o| o.result.is_err()).count()
+    }
+    /// True iff every hook succeeded.
+    pub fn all_ok(&self) -> bool {
+        self.err_count() == 0
+    }
+}
+
+/// Execute caller-provided per-kernel launch hooks for runtime warmup.
+///
+/// While [`compile_warmup`] just produces cubins (cheap, no GPU memory),
+/// this API actually launches each kernel with realistic shapes/data to
+/// trigger runtime-only side effects: CUDA module load, shared-memory
+/// pool pre-allocation, occupancy decisions, driver lazy-init paths.
+///
+/// # Failure isolation
+/// One hook's failure (`Err` or panic) does NOT prevent subsequent hooks
+/// from running; all results are aggregated in [`WarmupReport`]. The
+/// top-level `Result` only reports failures of device-context init.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let report = my_module::_execute_warmup(vec![
+///     LaunchHook::new("matmul",  |_| { /* alloc tensors + launch */ Ok(()) }),
+///     LaunchHook::new("softmax", |_| { /* alloc tensors + launch */ Ok(()) }),
+/// ])?;
+/// assert!(report.all_ok());
+/// ```
+pub fn execute_warmup(
+    module_name: &str,
+    entries: &[EntryMeta],
+    hooks: Vec<LaunchHook>,
+) -> Result<WarmupReport, Error> {
+    let device_id = get_default_device();
+    let _ = with_global_device_context(device_id, |_| {})?;
+
+    let ctx = WarmupCtx { device_id };
+    let mut report = WarmupReport::default();
+
+    for hook in hooks {
+        let LaunchHook { function_name, launch } = hook;
+
+        // Unknown function: record as per-hook failure, don't abort loop.
+        if !entries.iter().any(|e| e.function_name == function_name) {
+            let msg = format!(
+                "execute_warmup: unknown function '{}' in module '{}'",
+                function_name, module_name
+            );
+            report.outcomes.push(HookOutcome {
+                function_name,
+                result: Err(Error::KernelLaunch(KernelLaunchError(msg))),
+                elapsed: std::time::Duration::ZERO,
+                jit_compiles: 0,
+            });
+            continue;
+        }
+
+        let before = jit_compile_count();
+        let t0 = std::time::Instant::now();
+
+        // catch_unwind so a panicking hook becomes Err and the loop survives.
+        // GPU state after a panic is not guaranteed consistent — this is
+        // best-effort isolation, not a recovery story.
+        let fn_name_for_panic = function_name.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            launch(&ctx)
+        }))
+        .unwrap_or_else(|panic_info| {
+            Err(Error::KernelLaunch(KernelLaunchError(format!(
+                "panic in execute_warmup hook '{}': {:?}",
+                fn_name_for_panic, panic_info
+            ))))
+        });
+
+        let elapsed = t0.elapsed();
+        let jit_compiles = jit_compile_count() - before;
+
+        jit_log!(
+            "execute_warmup: {module_name}::{} → {} ({}ms, jit+{})",
+            function_name,
+            if result.is_ok() { "ok" } else { "err" },
+            elapsed.as_millis(),
+            jit_compiles,
+        );
+
+        report.outcomes.push(HookOutcome {
+            function_name,
+            result,
+            elapsed,
+            jit_compiles,
+        });
+    }
+
+    Ok(report)
+}
+
 /// Validates that all partition grids match the expected launch grid.
 pub fn validate_grids(
     grid: (u32, u32, u32),

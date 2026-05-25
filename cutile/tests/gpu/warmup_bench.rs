@@ -20,7 +20,7 @@ use cutile::api;
 use cutile::prelude::{DeviceOp, PartitionOp};
 use cutile::tile_kernel::{
     contains_cuda_function, get_default_device, jit_compile_count,
-    CompileOptions, TileFunctionKey, TileKernel, WarmupSpec,
+    CompileOptions, LaunchHook, TileFunctionKey, TileKernel, WarmupSpec,
 };
 use cutile_compiler::cuda_tile_runtime_utils::{
     get_compiler_version, get_cuda_toolkit_version, get_gpu_name,
@@ -244,21 +244,33 @@ fn full_warmup_workflow() {
             "compile_warmup must perform exactly one JIT compile"
         );
 
-        // Step 2: first real launch — same key → cache hit. 
+        // Step 2: execute_warmup with a hook running the same kernel
+        //          with realistic shapes — same key → cache hit.
         let t1 = Instant::now();
-        let x = api::ones::<f32>(&[256]).sync().unwrap();
-        let y = api::ones::<f32>(&[256]).sync().unwrap();
-        let z = api::zeros::<f32>(&[256]).partition([128]).sync().unwrap();
-        let _ = bench_module::vector_add(z, &x, &y)
-            .generics(vec!["f32".into(), "128".into()])
-            .sync()
-            .unwrap();
-        let first_launch_time = t1.elapsed();
-        let c_after_first = jit_compile_count();
+        let report = bench_module::_execute_warmup(vec![LaunchHook::new(
+            "vector_add",
+            |_| {
+                let x = api::ones::<f32>(&[256]).sync()?;
+                let y = api::ones::<f32>(&[256]).sync()?;
+                let z = api::zeros::<f32>(&[256]).partition([128]).sync()?;
+                let _ = bench_module::vector_add(z, &x, &y)
+                    .generics(vec!["f32".into(), "128".into()])
+                    .sync()?;
+                Ok(())
+            },
+        )])
+        .expect("execute_warmup failed");
+        let execute_time = t1.elapsed();
+        let c_after_execute = jit_compile_count();
+        assert!(report.all_ok(), "hook must succeed: {:?}", report);
         assert_eq!(
-            c_after_first, c_after_compile,
-            "first launch after compile_warmup must NOT recompile (key must \
-             match): counter moved from {c_after_compile} to {c_after_first}"
+            report.outcomes[0].jit_compiles, 0,
+            "execute_warmup hook after compile_warmup must NOT recompile \
+             (key must match)"
+        );
+        assert_eq!(
+            c_after_execute, c_after_compile,
+            "global counter must not move either: {c_after_compile} → {c_after_execute}"
         );
 
         // Step 3: production call — cache hit.
@@ -278,8 +290,8 @@ fn full_warmup_workflow() {
             compile_time
         );
         println!(
-            "║  2. first real launch: {:>10.1?}  (cache: +0 compile)  ║",
-            first_launch_time
+            "║  2. execute_warmup:    {:>10.1?}  (cache: +0 compile)  ║",
+            execute_time
         );
         println!(
             "║  3. production call:  {:>10.1?}  (cache: +0 compile)  ║",

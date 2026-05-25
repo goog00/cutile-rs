@@ -401,6 +401,34 @@ fn module_inner(
                 specs,
             )
         }
+
+        /// Run per-kernel launch hooks for this module with realistic shapes/data.
+        ///
+        /// Convenience wrapper around [`execute_warmup`] that automatically
+        /// supplies the module name and entry metadata. Each hook is run
+        /// independently; failures (Err or panic) are isolated and collected
+        /// into the returned [`WarmupReport`] rather than short-circuiting.
+        ///
+        /// # Example
+        ///
+        /// ```rust,ignore
+        /// let report = my_module::_execute_warmup(vec![
+        ///     LaunchHook::new("vector_add", |_| { /* alloc + launch */ Ok(()) }),
+        /// ])?;
+        /// assert!(report.all_ok());
+        /// ```
+        pub fn _execute_warmup(
+            hooks: Vec<#tile_rust_crate_root::tile_kernel::LaunchHook>,
+        ) -> Result<
+            #tile_rust_crate_root::tile_kernel::WarmupReport,
+            #tile_rust_crate_root::error::Error,
+        > {
+            #tile_rust_crate_root::tile_kernel::execute_warmup(
+                #module_name_str,
+                &_entries(),
+                hooks,
+            )
+        }
     };
 
     let res = if entry_functions.is_empty() {
