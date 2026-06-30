@@ -385,3 +385,67 @@ fn cache_hit_path_cost() {
         report("(C) get_gpu_name() only (mutex + String clone)", &gpu_name_samples);
     });
 }
+
+/// (B) under concurrency: runs the full hit-path build (key + hash, which takes
+/// the `get_gpu_name()` mutex) across thread counts. The lock sits at its real
+/// ~5% duty cycle inside the path, so contention is representative.
+///
+///   threads=1 per-call ties back to (B) (~5.5µs).
+///   Flat per-call as threads grow => the mutex isn't serializing the path.
+///
+/// Run with:
+///   cargo test --test gpu warmup_bench::hit_path_contention -- --nocapture
+#[test]
+fn hit_path_contention() {
+    common::with_test_stack(|| {
+        let _guard = common::cache_test_lock();
+
+        // Prime get_gpu_name's cache so workers take the locked read path,
+        // not the driver.
+        let _ = get_gpu_name(get_default_device());
+
+        let generics = std::sync::Arc::new(vec!["f32".to_string(), "128".to_string()]);
+        let spec_args = std::sync::Arc::new(vector_add_spec_args(256, 128));
+
+        const CALLS_PER_THREAD: usize = 20_000;
+        println!("\n=== hit-path (build key + hash) contention ===");
+        for threads in [1usize, 2, 4, 8, 16] {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let b = barrier.clone();
+                    let g = generics.clone();
+                    let s = spec_args.clone();
+                    std::thread::spawn(move || {
+                        // Release all threads at once for real contention.
+                        b.wait();
+                        let t0 = Instant::now();
+                        for _ in 0..CALLS_PER_THREAD {
+                            let key = bench_key((*g).clone(), (*s).clone());
+                            drop(std::hint::black_box(key.get_hash_string()));
+                        }
+                        t0.elapsed()
+                    })
+                })
+                .collect();
+
+            let mut wall = std::time::Duration::ZERO; // slowest thread
+            let mut sum = std::time::Duration::ZERO; // for mean per-call
+            for h in handles {
+                let e = h.join().unwrap();
+                sum += e;
+                wall = wall.max(e);
+            }
+            let total_calls = (threads * CALLS_PER_THREAD) as u32;
+            let per_call = sum / total_calls;
+            let throughput = total_calls as f64 / wall.as_secs_f64();
+            println!(
+                "  threads={threads:>2}  per-call(mean)={per_call:>9.3?}  wall={wall:>9.3?}  throughput={throughput:>12.0}/s",
+            );
+        }
+        println!(
+            "Read as: threads=1 ties back to (B); flat per-call as threads grow \
+             => the get_gpu_name lock inside the path isn't serializing.\n"
+        );
+    });
+}
