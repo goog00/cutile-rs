@@ -328,12 +328,12 @@ fn cache_hit_path_cost() {
 
         const LAUNCH_ITERS: usize = 500;
         const CPU_ITERS: usize = 5000;
-        let tile = "128";
+        let tile = "256";
         let generics = vec!["f32".to_string(), tile.to_string()];
 
         // Prime: first call to this tile JIT-compiles (miss); everything after
         // is a cache hit. Fill kernel primed so only vector_add moves the counter.
-        let spec_args = vector_add_spec_args(256, 128);
+        let spec_args = vector_add_spec_args(256, 256);
         let c0 = jit_compile_count();
         let _ = timed_kernel_call(tile);
         let c_after_prime = jit_compile_count();
