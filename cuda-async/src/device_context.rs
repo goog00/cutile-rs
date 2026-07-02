@@ -147,11 +147,22 @@ pub fn evict_kernel(key_str: &str) -> bool {
 /// The returned `OnceCell` lets the caller `get_or_try_init` the compile
 /// exactly once across threads. The DashMap shard lock is released before
 /// this returns, so the slow compile never holds it.
+///
+/// Hits take the read path (shard read lock, no allocation); only a miss falls
+/// back to `entry()` (write lock + owned key).
 pub fn kernel_cache_slot(key_str: &str) -> Arc<OnceCell<CompiledKernel>> {
-    let entry = get_kernel_cache()
-        .entry(key_str.to_string())
-        .or_insert_with(|| Arc::new(OnceCell::new()));
-    Arc::clone(entry.value())
+    let cache = get_kernel_cache();
+    if let Some(existing) = cache.get(key_str) {
+        return Arc::clone(existing.value());
+    }
+    // `get` returned None holding no lock, so the write path is deadlock-free;
+    // `or_insert_with` still resolves a concurrent insert into one slot per key.
+    Arc::clone(
+        cache
+            .entry(key_str.to_string())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .value(),
+    )
 }
 
 // ── Per-thread device state ──────────────────────────────────────────────────

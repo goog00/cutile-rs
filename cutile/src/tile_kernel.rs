@@ -39,7 +39,8 @@ macro_rules! jit_log {
 
 static JIT_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Process-global JIT compile counter: +1 per cache miss, +0 on cache hits.
+/// Process-global JIT compile counter: +1 per successful compile, +0 on cache
+/// hits and on failed compiles. Equals the number of distinct kernels cached.
 /// Snapshot before a call and check the delta to get exact miss counts.
 pub fn jit_compile_count() -> u64 {
     JIT_COMPILE_COUNT.load(Ordering::Relaxed)
@@ -453,14 +454,11 @@ pub fn compile_from_context<F: Fn() -> Module>(
 
     // Use OnceCell::get_or_try_init for single-flight compilation dedup.
     // Only one thread executes the closure; others block and see the result.
-    let compiled = slot.get_or_try_init(|| -> Result<CompiledKernel, Error> {
-        // Cache miss: this closure runs exactly once per key, only on a real
-        // compile. Record it so tests can assert hit/miss deterministically.
-        record_jit_compile();
+    let compiled = match slot.get_or_try_init(|| -> Result<CompiledKernel, Error> {
         jit_log!("{module_name}::{function_name} → JIT compiling...");
         // Build the module ASTs lazily — only on a real cache miss.
         let modules = CUDATileModules::from_kernel(kernel_ast())?;
-        compile_and_load_kernel(
+        let kernel = compile_and_load_kernel(
             &modules,
             module_name,
             function_name,
@@ -474,8 +472,23 @@ pub fn compile_from_context<F: Fn() -> Module>(
             &key.compile_options,
             device_id,
             &key_str,
-        )
-    })?;
+        )?;
+        // Count only a successful compile: a failed attempt leaves the slot empty
+        // and retries, so counting at the top would double-count on retry and
+        // break the "+1 per cached kernel" contract.
+        record_jit_compile();
+        Ok(kernel)
+    }) {
+        Ok(compiled) => compiled,
+        Err(e) => {
+            // A failed compile leaves an empty slot behind; drop it so repeated
+            // failing specializations (e.g. an autotuner probe) don't grow the
+            // cache unbounded. Remove only if still empty, in case a concurrent
+            // thread raced on this key and succeeded.
+            get_kernel_cache().remove_if(&key_str, |_, cell| cell.get().is_none());
+            return Err(e);
+        }
+    };
 
     Ok((
         Arc::clone(&compiled.function),
