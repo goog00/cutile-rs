@@ -121,6 +121,9 @@ pub struct CompiledKernel {
 /// single-flight compilation dedup (if multiple threads need the same kernel,
 /// only one compiles while the rest wait). Uses `once_cell::sync::OnceCell`
 /// for stable fallible initialization (`get_or_try_init`).
+///
+/// Grows unbounded: no cap or LRU (cutile-python caps at 2 GB with LRU
+/// eviction). Eviction is deferred to the disk-cache follow-up.
 static KERNEL_CACHE: OnceLock<DashMap<String, Arc<OnceCell<CompiledKernel>>>> = OnceLock::new();
 
 pub fn get_kernel_cache() -> &'static DashMap<String, Arc<OnceCell<CompiledKernel>>> {
