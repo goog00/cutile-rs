@@ -29,3 +29,6 @@ linkme = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Used by the #181 disk-cache gating experiment to measure the cost of hashing
+# the serialized bytecode into a content-addressed cache key.
+sha2 = { workspace = true }

@@ -55,3 +55,8 @@ mod warmup;
 
 #[path = "gpu/warmup_bench.rs"]
 mod warmup_bench;
+
+// Gating experiment for the #181 on-disk kernel cache: measures what fraction
+// of a cold JIT a content-addressed (bytecode-keyed) cache can actually skip.
+#[path = "gpu/jit_stage_timing.rs"]
+mod jit_stage_timing;

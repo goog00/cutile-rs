@@ -17,12 +17,41 @@ use crate::kernel_naming::KernelNaming;
 use crate::passes::name_resolution::NameResolver;
 use crate::syn_utils::*;
 use quote::ToTokens;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use syn::spanned::Spanned;
 use syn::{
     Expr, ExprMethodCall, GenericArgument, GenericParam, ImplItem, ImplItemFn, ItemConst, ItemFn,
     ItemImpl, ItemMod, ItemStatic, ItemStruct, ItemTrait, ItemType, PathArguments, Type,
 };
+
+/// Wall-clock breakdown of one [`CUDATileModules::from_kernel`] call.
+///
+/// Both halves run on **every cache miss** and neither depends on the
+/// specialization being compiled, so together they are a fixed per-miss cost
+/// that a process compiling N specializations of one module pays N times.
+/// Consumed by the gating experiment in `cutile/tests/gpu/jit_stage_timing.rs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ModuleBuildTimings {
+    /// Walking the kernel's `use` graph and calling each registry entry's
+    /// `build` fn, i.e. `syn::parse_str` over every dependency module's
+    /// captured source text.
+    pub ast_ms: f64,
+    /// `CUDATileModules::new`: cloning each module's `ItemMod` and running
+    /// `NameResolver::build` over all of them.
+    pub name_resolve_ms: f64,
+}
+
+thread_local! {
+    static LAST_MODULE_BUILD_TIMINGS: Cell<Option<ModuleBuildTimings>> = const { Cell::new(None) };
+}
+
+/// Takes the [`ModuleBuildTimings`] of the most recent successful
+/// [`CUDATileModules::from_kernel`] **on the calling thread**, clearing them.
+pub fn take_module_build_timings() -> Option<ModuleBuildTimings> {
+    LAST_MODULE_BUILD_TIMINGS.with(|slot| slot.take())
+}
 
 /// Aggregated index of all DSL modules, types, impls, and functions.
 ///
@@ -257,6 +286,7 @@ impl CUDATileModules {
         use crate::use_classifier::{
             classify_use, collect_use_imports, UseCatalog, UseClassification,
         };
+        let t_ast = Instant::now();
 
         let registry: HashMap<&str, fn() -> Module> = CUTILE_MODULES
             .iter()
@@ -345,7 +375,18 @@ impl CUDATileModules {
             }
         }
 
+        let ast_ms = t_ast.elapsed().as_secs_f64() * 1000.0;
+
+        let t_resolve = Instant::now();
         let mut modules = Self::new(working_set)?;
+        let name_resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
+
+        LAST_MODULE_BUILD_TIMINGS.with(|slot| {
+            slot.set(Some(ModuleBuildTimings {
+                ast_ms,
+                name_resolve_ms,
+            }))
+        });
         modules.use_catalog = use_catalog;
         Ok(modules)
     }

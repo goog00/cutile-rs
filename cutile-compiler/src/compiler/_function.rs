@@ -35,9 +35,50 @@ use cutile_ir::ir::{
 use anyhow::Context as AnyhowContext;
 use quote::ToTokens;
 use std::any::type_name;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::time::Instant;
 use syn::spanned::Spanned;
+
+/// Wall-clock breakdown of one [`CUDATileFunctionCompiler::compile`] call.
+///
+/// `compile` turned out to be the dominant cost of a cold JIT for light
+/// kernels — 159 ms for a `z.store(x + y)` body on sm_89 — so it is split here
+/// to locate that. Consumed by the gating experiment in
+/// `cutile/tests/gpu/jit_stage_timing.rs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EmitTimings {
+    /// `emit_module_globals`: bounded by the number of `Global` statics.
+    pub globals_ms: f64,
+    /// `assign_expr_ids` + `type_inference::infer_function` +
+    /// `typed_dispatch_lowering::lower_function`.
+    pub typeck_ms: f64,
+    /// `compile_block`: lowering the typed body to Tile IR, inlining DSL calls.
+    /// Every inlined call site re-runs type inference on the callee body, so
+    /// most of this is nested inference — see `typeck_calls`.
+    pub block_ms: f64,
+    /// Total `infer_function` / `infer_method` calls in this compile, across
+    /// the entry body and every inlined call site.
+    pub typeck_calls: u64,
+    /// Wall time inside inference, outermost calls only.
+    pub typeck_total_ms: f64,
+    /// Whole `compile()` call. The remainder over the three fields above is
+    /// parameter-type conversion, block-region setup, and const-generic binding.
+    pub total_ms: f64,
+}
+
+thread_local! {
+    static LAST_EMIT_TIMINGS: Cell<Option<EmitTimings>> = const { Cell::new(None) };
+    /// `(typeck_ms, block_ms)` handed from `compile_entry_function` up to
+    /// `compile`, which owns the `EmitTimings` record.
+    static ENTRY_SPLIT: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+}
+
+/// Takes the [`EmitTimings`] of the most recent successful
+/// [`CUDATileFunctionCompiler::compile`] **on the calling thread**, clearing them.
+pub fn take_emit_timings() -> Option<EmitTimings> {
+    LAST_EMIT_TIMINGS.with(|slot| slot.take())
+}
 
 /// Compiles a single Rust function into Tile IR bytecode.
 pub struct CUDATileFunctionCompiler<'m> {
@@ -315,10 +356,26 @@ impl<'m> CUDATileFunctionCompiler<'m> {
 
     /// Compile the kernel function into a `cutile_ir::Module`.
     pub fn compile(&self) -> Result<Module, JITError> {
+        let t_total = Instant::now();
+        crate::passes::type_inference::reset_typeck_stats();
         let mut module = Module::new(&self.module_name);
+        let t_globals = Instant::now();
         self.emit_module_globals(&mut module)?;
+        let globals_ms = t_globals.elapsed().as_secs_f64() * 1000.0;
         let entry_op = self.compile_entry_function(&mut module)?;
         module.functions.push(entry_op);
+        let (typeck_ms, block_ms) = ENTRY_SPLIT.with(|slot| slot.get());
+        let stats = crate::passes::type_inference::typeck_stats();
+        LAST_EMIT_TIMINGS.with(|slot| {
+            slot.set(Some(EmitTimings {
+                globals_ms,
+                typeck_ms,
+                block_ms,
+                typeck_calls: stats.calls,
+                typeck_total_ms: stats.total_ms,
+                total_ms: t_total.elapsed().as_secs_f64() * 1000.0,
+            }))
+        });
         Ok(module)
     }
 
@@ -502,6 +559,7 @@ impl<'m> CUDATileFunctionCompiler<'m> {
 
         ctx.default_terminator = Some(BlockTerminator::Return);
 
+        let t_typeck = Instant::now();
         let mut typed_fn_item = fn_item.clone();
         crate::passes::node_ids::assign_expr_ids(&mut typed_fn_item);
         let typeck_results = crate::passes::type_inference::infer_function(
@@ -512,6 +570,7 @@ impl<'m> CUDATileFunctionCompiler<'m> {
         )?;
         let lowered_fn_item =
             crate::passes::typed_dispatch_lowering::lower_function(&typed_fn_item, &typeck_results);
+        let typeck_ms = t_typeck.elapsed().as_secs_f64() * 1000.0;
         let previous_typeck_results = self.typeck_results.replace(Some(typeck_results));
 
         if std::env::var("CUTILE_DEBUG_COMPILER2").is_ok() {
@@ -521,6 +580,7 @@ impl<'m> CUDATileFunctionCompiler<'m> {
             );
         }
 
+        let t_block = Instant::now();
         let return_value = self.compile_block(
             module,
             block_id,
@@ -529,6 +589,8 @@ impl<'m> CUDATileFunctionCompiler<'m> {
             &mut ctx,
             None,
         );
+        let block_ms = t_block.elapsed().as_secs_f64() * 1000.0;
+        ENTRY_SPLIT.with(|slot| slot.set((typeck_ms, block_ms)));
         self.typeck_results.replace(previous_typeck_results);
         let return_value = return_value?;
         if return_value.is_some() {

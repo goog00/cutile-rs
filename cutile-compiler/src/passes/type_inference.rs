@@ -24,7 +24,9 @@ use crate::syn_utils::*;
 use crate::types::{get_lit_type, TypeParam};
 use proc_macro2::TokenTree;
 use quote::ToTokens;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use syn::{
     Expr, ExprCall, ExprLit, ExprMacro, ExprMethodCall, GenericArgument, Generics, ImplItemFn,
     ItemFn, ItemImpl, Lit, Pat, PathArguments, Stmt, TraitItem, Type, TypeParamBound,
@@ -400,7 +402,74 @@ struct InferenceState {
     expr_terms: HashMap<NodeId, InferredTy>,
 }
 
+// ── Type-inference call accounting ──────────────────────────────────────────
+//
+// `compile_inline` re-runs `infer_function` / `infer_method` at *every* call
+// site rather than once per (callee, generic instantiation), and then recurses
+// into the callee body, which inlines its own calls the same way. These
+// counters expose the resulting multiplier, read back by the gating experiment
+// in `cutile/tests/gpu/jit_stage_timing.rs`.
+
+/// How many times inference ran, and how long it took in total, during one
+/// `CUDATileFunctionCompiler::compile`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TypeckStats {
+    /// Calls to `infer_function` + `infer_method`, including nested ones.
+    pub calls: u64,
+    /// Wall time inside inference, counting each outermost call once (nested
+    /// calls are already inside their parent's span, so they are not added).
+    pub total_ms: f64,
+}
+
+thread_local! {
+    static TYPECK_STATS: Cell<TypeckStats> = const { Cell::new(TypeckStats { calls: 0, total_ms: 0.0 }) };
+    static TYPECK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Zeroes the counters. Call before a compile.
+pub fn reset_typeck_stats() {
+    TYPECK_STATS.with(|s| s.set(TypeckStats::default()));
+    TYPECK_DEPTH.with(|d| d.set(0));
+}
+
+/// Reads the counters accumulated since the last [`reset_typeck_stats`].
+pub fn typeck_stats() -> TypeckStats {
+    TYPECK_STATS.with(|s| s.get())
+}
+
+/// Times `f` as one inference call, attributing wall time only at depth 0 so
+/// nested calls are not double-counted.
+fn record_typeck<T>(f: impl FnOnce() -> T) -> T {
+    let depth = TYPECK_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    let start = Instant::now();
+    let out = f();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    TYPECK_DEPTH.with(|d| d.set(d.get() - 1));
+    TYPECK_STATS.with(|s| {
+        let mut stats = s.get();
+        stats.calls += 1;
+        if depth == 0 {
+            stats.total_ms += elapsed;
+        }
+        s.set(stats);
+    });
+    out
+}
+
 pub fn infer_function(
+    compiler: &CUDATileFunctionCompiler<'_>,
+    fn_item: &ItemFn,
+    generic_vars: &GenericVars,
+    initial_types: HashMap<String, TileRustType>,
+) -> Result<TypeckResults, JITError> {
+    record_typeck(|| infer_function_inner(compiler, fn_item, generic_vars, initial_types))
+}
+
+fn infer_function_inner(
     compiler: &CUDATileFunctionCompiler<'_>,
     fn_item: &ItemFn,
     generic_vars: &GenericVars,
@@ -434,6 +503,26 @@ pub fn infer_function(
 }
 
 pub fn infer_method(
+    compiler: &CUDATileFunctionCompiler<'_>,
+    impl_item: &ItemImpl,
+    impl_method: &ImplItemFn,
+    self_ty: &Type,
+    generic_vars: &GenericVars,
+    initial_types: HashMap<String, TileRustType>,
+) -> Result<TypeckResults, JITError> {
+    record_typeck(|| {
+        infer_method_inner(
+            compiler,
+            impl_item,
+            impl_method,
+            self_ty,
+            generic_vars,
+            initial_types,
+        )
+    })
+}
+
+fn infer_method_inner(
     compiler: &CUDATileFunctionCompiler<'_>,
     impl_item: &ItemImpl,
     impl_method: &ImplItemFn,

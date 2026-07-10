@@ -9,12 +9,14 @@
 use crate::error::JITError;
 use cuda_core::{get_device_sm_name, Device};
 use cutile_ir::bytecode::{write_bytecode_version, BytecodeVersion};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Environment variable used to override the `tileiras` executable.
@@ -365,19 +367,103 @@ fn probe_max_supported_bytecode_version(tileiras: &Path) -> BytecodeVersion {
     BytecodeVersion::MIN_SUPPORTED
 }
 
+// =========================================================================
+// Backend stage timing
+//
+// Instrumentation for the #181 gating experiment: the persistent disk cache
+// can only skip the `tileiras` subprocess (and the temp `.bc` write that
+// feeds it), never the frontend. Deciding between a content-addressed key
+// and an input-derived one therefore hinges on what fraction of a cold JIT
+// `tileiras` actually accounts for. These numbers answer that.
+// =========================================================================
+
+/// Wall-clock breakdown of one [`compile_tile_ir_module`] call.
+///
+/// `verify_ms + serialize_ms + write_bc_ms + tileiras_ms` does not exactly
+/// equal `total_ms`: the remainder is bytecode-version selection, `Command`
+/// construction, and output decoding on the error path.
+///
+/// Under a content-addressed disk cache, a hit skips exactly `write_bc_ms +
+/// tileiras_ms` and pays a `sha256` over `bytecode_len` bytes instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BackendTimings {
+    /// `verify_dominance` + `verify_bytecode_indices`.
+    pub verify_ms: f64,
+    /// `write_bytecode_version` — IR to `.bc` bytes, in process.
+    pub serialize_ms: f64,
+    /// Writing the `.bc` bytes to a temp file for `tileiras` to read.
+    pub write_bc_ms: f64,
+    /// The `tileiras` subprocess: spawn, LLVM backend, exit. The median across
+    /// [`tileiras_samples`](Self::tileiras_samples) runs of the same bytecode.
+    pub tileiras_ms: f64,
+    /// Fastest and slowest of those runs. With one sample all three are equal.
+    /// The spread is large on a loaded machine: the same `vector_add` has been
+    /// measured at 68 ms and at 204 ms in different runs. Check any conclusion
+    /// drawn from `tileiras_ms` against it.
+    pub tileiras_min_ms: f64,
+    pub tileiras_max_ms: f64,
+    /// How many times `tileiras` was run, per `CUTILE_JIT_TILEIRAS_SAMPLES`.
+    pub tileiras_samples: u32,
+    /// Subtract this from any outer wall-clock measurement of
+    /// `compile_tile_ir_module` to obtain a duration consistent with
+    /// [`tileiras_ms`](Self::tileiras_ms).
+    ///
+    /// It covers two things, both zero with a single sample:
+    ///
+    /// 1. the extra `tileiras` runs beyond the first, and their cubin cleanup;
+    /// 2. the difference between the **first** run — the one that produced the
+    ///    cubin, and the one an outer timer actually saw — and the **median**
+    ///    across all runs, which is what `tileiras_ms` reports. Without this
+    ///    term a caller mixes two different measurements of `tileiras` into the
+    ///    numerator and denominator of the same ratio. It may be negative.
+    pub probe_overhead_ms: f64,
+    /// Whole `compile_tile_ir_module` call, normalized so the `tileiras`
+    /// contribution is [`tileiras_ms`](Self::tileiras_ms) — the median — rather
+    /// than whichever run happened to produce the cubin.
+    pub total_ms: f64,
+    /// Size of the serialized `.bc`. Determines the cost of hashing it for a
+    /// content-addressed key.
+    pub bytecode_len: usize,
+    /// Size of the emitted cubin, or 0 if it could not be stat'd.
+    pub cubin_len: u64,
+}
+
+thread_local! {
+    /// Timings from the most recent successful `compile_tile_ir_module` on this
+    /// thread. Written unconditionally (a `Cell` store, on the compile path
+    /// only) so callers need no env var to read them.
+    static LAST_BACKEND_TIMINGS: Cell<Option<BackendTimings>> = const { Cell::new(None) };
+}
+
+/// Takes the [`BackendTimings`] recorded by the most recent successful
+/// [`compile_tile_ir_module`] **on the calling thread**, clearing them.
+///
+/// Compilation runs on the thread that wins the single-flight race, which is
+/// the thread that called `.compile()` or `.sync()`, so a caller that just
+/// compiled can read its own timings back. Returns `None` if nothing was
+/// compiled on this thread since the last take (e.g. the call was a cache hit).
+pub fn take_backend_timings() -> Option<BackendTimings> {
+    LAST_BACKEND_TIMINGS.with(|slot| slot.take())
+}
+
 /// Compiles a `cutile_ir::Module` to a `.cubin` file via bytecode serialization and `tileiras`.
 ///
 /// Returns `Err` (not panic) on any failure so callers can propagate it and run
 /// their cache-cleanup paths; a panic would unwind past that and across FFI frames.
+///
+/// On success, records a per-stage breakdown retrievable via
+/// [`take_backend_timings`].
 pub fn compile_tile_ir_module(
     module: &cutile_ir::Module,
     gpu_name: &str,
 ) -> Result<String, JITError> {
+    let t_total = Instant::now();
     let tmp_dir = env::temp_dir();
     let base_filename = tmp_dir.join(Uuid::new_v4().to_string());
     let bc_filename = format!("{}.bc", base_filename.to_str().unwrap());
     let cubin_filename = format!("{}.cubin", base_filename.to_str().unwrap());
 
+    let t_verify = Instant::now();
     module
         .verify_dominance()
         .map_err(|e| JITError::Generic(format!("tile-ir dominance verification failed: {e}")))?;
@@ -387,20 +473,27 @@ pub fn compile_tile_ir_module(
             "tile-ir bytecode value-index verification failed: {e}"
         ))
     })?;
+    let verify_ms = ms(t_verify);
 
     // Dump IR via unified CUTILE_DUMP mechanism (also honors legacy TILE_IR_DUMP).
-    crate::dump::dump_module(
-        crate::dump::DumpStage::Ir,
-        &module.name,
-        &module.to_mlir_text(),
-    );
+    // `to_mlir_text` renders the whole module, so it stays behind `should_dump`
+    // rather than being evaluated as an argument on every compile.
+    if crate::dump::should_dump(crate::dump::DumpStage::Ir) {
+        crate::dump::dump_module(
+            crate::dump::DumpStage::Ir,
+            &module.name,
+            &module.to_mlir_text(),
+        );
+    }
 
     let bytecode_version = selected_bytecode_version();
+    let t_serialize = Instant::now();
     let bytes = write_bytecode_version(module, bytecode_version).map_err(|e| {
         JITError::Generic(format!(
             "Failed to serialize bytecode for {bc_filename}: {e}"
         ))
     })?;
+    let serialize_ms = ms(t_serialize);
 
     if crate::dump::should_dump(crate::dump::DumpStage::Bytecode) {
         let decoded = cutile_ir::decode_bytecode(&bytes)
@@ -408,9 +501,12 @@ pub fn compile_tile_ir_module(
         crate::dump::dump_module(crate::dump::DumpStage::Bytecode, &module.name, &decoded);
     }
 
+    let t_write_bc = Instant::now();
     std::fs::write(&bc_filename, &bytes).map_err(|e| {
         JITError::Generic(format!("Failed to write bytecode for {bc_filename}: {e}"))
     })?;
+    let write_bc_ms = ms(t_write_bc);
+
     let tileiras = tileiras_binary();
     let args = [
         "--gpu-name",
@@ -421,10 +517,12 @@ pub fn compile_tile_ir_module(
         &cubin_filename,
         &bc_filename,
     ];
+    let t_tileiras = Instant::now();
     let output = Command::new(&tileiras)
         .args(args)
         .output()
         .map_err(|e| JITError::Generic(tileiras_launch_error(&tileiras, &args, &bc_filename, e)))?;
+    let tileiras_ms = ms(t_tileiras);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -443,7 +541,94 @@ pub fn compile_tile_ir_module(
             display_command(&tileiras, &args),
         )));
     }
+
+    let total_ms = ms(t_total);
+    let cubin_len = std::fs::metadata(&cubin_filename)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Extra `tileiras` runs on the same bytecode, for callers measuring its
+    // cost. Off unless `CUTILE_JIT_TILEIRAS_SAMPLES` is set, since each run
+    // costs a full backend compile. Their cubins are discarded; the one from
+    // the first run is what we return.
+    let mut runs = vec![tileiras_ms];
+    let probe_start = Instant::now();
+    for i in 1..tileiras_sample_count() {
+        let probe_cubin = format!("{}.probe{i}.cubin", base_filename.to_str().unwrap());
+        let probe_args = [
+            "--gpu-name",
+            gpu_name,
+            "--opt-level",
+            "3",
+            "-o",
+            &probe_cubin,
+            &bc_filename,
+        ];
+        let start = Instant::now();
+        let ok = Command::new(&tileiras)
+            .args(probe_args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            runs.push(ms(start));
+        }
+        let _ = std::fs::remove_file(&probe_cubin);
+    }
+    // Everything after the first run is measurement scaffolding, and the run an
+    // outer timer saw was the first one, not the median. Hand both back so the
+    // caller can normalize. `tileiras_ms` (the first run) is `runs[0]` until we
+    // sort.
+    let first_run_ms = runs[0];
+    let extra_runs_ms = if runs.len() > 1 { ms(probe_start) } else { 0.0 };
+    runs.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in timings"));
+    let median = runs[runs.len() / 2];
+    let probe_overhead_ms = extra_runs_ms + (first_run_ms - median);
+
+    LAST_BACKEND_TIMINGS.with(|slot| {
+        slot.set(Some(BackendTimings {
+            verify_ms,
+            serialize_ms,
+            write_bc_ms,
+            tileiras_ms: median,
+            tileiras_min_ms: runs[0],
+            tileiras_max_ms: runs[runs.len() - 1],
+            tileiras_samples: runs.len() as u32,
+            probe_overhead_ms,
+            // `t_total` spanned the first run, not the median.
+            total_ms: total_ms - (first_run_ms - median),
+            bytecode_len: bytes.len(),
+            cubin_len,
+        }))
+    });
     Ok(cubin_filename)
+}
+
+/// Elapsed milliseconds since `start`, as `f64`.
+fn ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Environment variable asking `compile_tile_ir_module` to run `tileiras`
+/// several times on the same bytecode and report the median.
+///
+/// `tileiras` timing varies widely with machine load, and it sits in the
+/// numerator of the disk-cache key decision (see the gating experiment in
+/// `cutile/tests/gpu/jit_stage_timing.rs`), so a single sample can move that
+/// decision. Set this to 3 or 5 when the number matters. Each extra sample
+/// costs a full backend compile.
+pub const TILEIRAS_SAMPLES_ENV: &str = "CUTILE_JIT_TILEIRAS_SAMPLES";
+
+/// Number of `tileiras` runs per compile. Defaults to 1; clamped to `[1, 15]`.
+fn tileiras_sample_count() -> u32 {
+    static COUNT: OnceLock<u32> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        env::var(TILEIRAS_SAMPLES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(1)
+            .clamp(1, 15)
+    })
 }
 
 fn tileiras_launch_error(

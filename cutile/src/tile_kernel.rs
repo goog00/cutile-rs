@@ -10,13 +10,16 @@ use cuda_async::error::DeviceError;
 use cuda_core::DType;
 use cuda_core::{memcpy_dtoh_async, Function};
 use cutile_compiler::ast::Module;
+use cutile_compiler::compiler::_function::{take_emit_timings, EmitTimings};
+use cutile_compiler::compiler::_module::{take_module_build_timings, ModuleBuildTimings};
 use cutile_compiler::compiler::{CUDATileFunctionCompiler, CUDATileModules};
 use cutile_compiler::cuda_tile_runtime_utils::{
     compile_tile_ir_module, env_flag_enabled, get_compiler_version, get_cuda_toolkit_version,
-    get_gpu_name,
+    get_gpu_name, take_backend_timings, BackendTimings,
 };
 use cutile_compiler::specialization::{DivHint, SpecializationBits};
 use std::alloc::{alloc, Layout};
+use std::cell::Cell;
 use std::fs;
 use std::future::IntoFuture;
 use std::path::PathBuf;
@@ -50,6 +53,107 @@ pub fn jit_compile_count() -> u64 {
 #[inline]
 fn record_jit_compile() {
     JIT_COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+// ── Per-compile stage timing (see tests/gpu/jit_stage_timing.rs) ───────────
+
+/// Wall-clock breakdown of one cold JIT compile.
+///
+/// The persistent disk cache proposed in issue #181 is keyed on the serialized
+/// bytecode, so a hit can only skip work that happens *after* serialization.
+/// This struct splits a compile along exactly that line:
+///
+/// - **Skippable** on a disk hit: [`BackendTimings::write_bc_ms`] and
+///   [`BackendTimings::tileiras_ms`].
+/// - **Not skippable**: `frontend_ms`, the rest of the backend, and the module
+///   load. A hit pays these plus a `sha256` over the bytecode.
+///
+/// Read it back with [`take_last_jit_timings`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct JitTimings {
+    /// `from_kernel`'s `use`-graph walk: `syn::parse_str` over the kernel
+    /// module's captured source text and every dependency module's.
+    pub module_ast_ms: f64,
+    /// `from_kernel`'s `CUDATileModules::new`: `ItemMod` clones plus
+    /// `NameResolver::build`.
+    pub name_resolve_ms: f64,
+    /// `CUDATileFunctionCompiler::new`, which includes `generate_entry_point`
+    /// and produces the `Validator`.
+    pub compiler_new_ms: f64,
+    /// `compiler.compile()`: emit `cutile_ir::Module` from the entry point.
+    pub emit_ms: f64,
+    /// Breakdown of `emit_ms`.
+    pub emit: EmitTimings,
+    /// `to_mlir_text()` for `print_ir` / `dump_mlir_dir`. Zero unless one of
+    /// those entry attributes is set.
+    pub ir_text_ms: f64,
+    /// Bytecode serialization and the `tileiras` subprocess.
+    pub backend: BackendTimings,
+    /// `cuModuleLoad` of the emitted cubin.
+    pub load_module_ms: f64,
+    /// `cuModuleGetFunction` for the kernel entry point.
+    pub load_function_ms: f64,
+    /// Whole `compile_and_load_kernel` call.
+    pub total_ms: f64,
+}
+
+impl JitTimings {
+    /// `from_kernel`: the whole module-graph build. Independent of the
+    /// specialization, and repeated on every cache miss.
+    pub fn module_build_ms(&self) -> f64 {
+        self.module_ast_ms + self.name_resolve_ms
+    }
+
+    /// Rust AST to `cutile_ir::Module`, plus the `Validator`.
+    pub fn frontend_ms(&self) -> f64 {
+        self.compiler_new_ms + self.emit_ms
+    }
+
+    /// Time a content-addressed disk-cache hit would avoid: the temp `.bc`
+    /// write and the `tileiras` subprocess.
+    pub fn skippable_ms(&self) -> f64 {
+        self.backend.write_bc_ms + self.backend.tileiras_ms
+    }
+
+    /// Fraction of a cold compile that a content-addressed disk-cache hit
+    /// avoids, in `[0, 1]`.
+    pub fn skippable_fraction(&self) -> f64 {
+        if self.total_ms <= 0.0 {
+            return 0.0;
+        }
+        self.skippable_ms() / self.total_ms
+    }
+
+    /// Upper bound on what *any* disk cache could avoid: everything but loading
+    /// the cubin into the driver. This is what an input-derived key would skip.
+    pub fn max_skippable_ms(&self) -> f64 {
+        self.total_ms - self.load_module_ms - self.load_function_ms
+    }
+
+    /// Share of the achievable savings that a content-addressed key captures,
+    /// in `[0, 1]`. This is the number the #181 key decision turns on: at 1.0
+    /// the two key designs are equivalent, at 0.0 the content-addressed key
+    /// saves nothing an input-derived key would not save far more of.
+    pub fn capture_rate(&self) -> f64 {
+        let max = self.max_skippable_ms();
+        if max <= 0.0 {
+            return 0.0;
+        }
+        self.skippable_ms() / max
+    }
+}
+
+thread_local! {
+    static LAST_JIT_TIMINGS: Cell<Option<JitTimings>> = const { Cell::new(None) };
+}
+
+/// Takes the [`JitTimings`] of the most recent successful compile **on the
+/// calling thread**, clearing them.
+///
+/// Returns `None` when the last call was a cache hit (nothing was compiled) or
+/// when another thread won the single-flight race and did the compile.
+pub fn take_last_jit_timings() -> Option<JitTimings> {
+    LAST_JIT_TIMINGS.with(|slot| slot.take())
 }
 
 use crate::error::*;
@@ -291,6 +395,7 @@ fn compile_and_load_kernel(
     compile_options: &CompileOptions,
     device_id: usize,
     key_str: &str,
+    module_build: ModuleBuildTimings,
 ) -> Result<CompiledKernel, Error> {
     let t0 = std::time::Instant::now();
 
@@ -304,7 +409,8 @@ fn compile_and_load_kernel(
         scalar_hints.iter().map(|x| (x.0.as_str(), &x.1)).collect();
 
     let stage1_start = std::time::Instant::now();
-    let (tile_module, validator) = {
+    let (tile_module, validator, compiler_new_ms, emit_ms, emit) = {
+        let compiler_new_start = std::time::Instant::now();
         let compiler = CUDATileFunctionCompiler::new(
             modules,
             module_name,
@@ -317,23 +423,33 @@ fn compile_and_load_kernel(
             gpu_name.to_string(),
             compile_options,
         )?;
+        let compiler_new_ms = compiler_new_start.elapsed().as_secs_f64() * 1000.0;
         let validator = Arc::new(compiler.get_validator());
+        let emit_start = std::time::Instant::now();
         let tile_module = compiler.compile()?;
-        (tile_module, validator)
+        let emit_ms = emit_start.elapsed().as_secs_f64() * 1000.0;
+        let emit = take_emit_timings().unwrap_or_default();
+        (tile_module, validator, compiler_new_ms, emit_ms, emit)
     };
     let stage1_ms = stage1_start.elapsed().as_secs_f64() * 1000.0;
 
     let stage2_start = std::time::Instant::now();
-    let cubin_filename = {
+    // `to_mlir_text` renders the whole module and is only consumed by the
+    // `print_ir` / `dump_mlir_dir` entry attributes, so it stays behind them.
+    let ir_text_start = std::time::Instant::now();
+    let print_ir =
+        modules.get_entry_arg_bool_by_function_name(module_name, function_name, "print_ir")?;
+    let dump_mlir_dir = modules.get_entry_arg_string_by_function_name(
+        module_name,
+        function_name,
+        "dump_mlir_dir",
+    )?;
+    if print_ir || dump_mlir_dir.is_some() {
         let ir_text = tile_module.to_mlir_text();
-        if modules.get_entry_arg_bool_by_function_name(module_name, function_name, "print_ir")? {
+        if print_ir {
             println!("COMPILED IR: {module_name}::{function_name}\n{ir_text}");
         }
-        if let Some(path) = modules.get_entry_arg_string_by_function_name(
-            module_name,
-            function_name,
-            "dump_mlir_dir",
-        )? {
+        if let Some(path) = dump_mlir_dir {
             write_ir(
                 module_name,
                 function_name,
@@ -343,18 +459,44 @@ fn compile_and_load_kernel(
                 ir_text.as_str(),
             );
         }
-        compile_tile_ir_module(&tile_module, gpu_name)?
-    };
-    let stage2_ms = stage2_start.elapsed().as_secs_f64() * 1000.0;
+    }
+    let ir_text_ms = ir_text_start.elapsed().as_secs_f64() * 1000.0;
+    let cubin_filename = compile_tile_ir_module(&tile_module, gpu_name)?;
+    let backend = take_backend_timings().unwrap_or_default();
+    // `CUTILE_JIT_TILEIRAS_SAMPLES` makes `compile_tile_ir_module` run tileiras
+    // several times to measure it. Those extra runs are inside the span we just
+    // timed; charging them to the compile would inflate it by that factor.
+    let stage2_ms = stage2_start.elapsed().as_secs_f64() * 1000.0 - backend.probe_overhead_ms;
 
     let stage3_start = std::time::Instant::now();
     let module = load_module_from_file(&cubin_filename, device_id)?;
+    let load_module_ms = stage3_start.elapsed().as_secs_f64() * 1000.0;
+    let load_function_start = std::time::Instant::now();
     let function = Arc::new(module.load_function(function_entry).map_err(|e| {
         Error::KernelLaunch(KernelLaunchError(format!(
             "failed to load '{function_entry}' from compiled cubin: {e}"
         )))
     })?);
+    let load_function_ms = load_function_start.elapsed().as_secs_f64() * 1000.0;
     let stage3_ms = stage3_start.elapsed().as_secs_f64() * 1000.0;
+
+    let module_build_ms = module_build.ast_ms + module_build.name_resolve_ms;
+    let timings = JitTimings {
+        module_ast_ms: module_build.ast_ms,
+        name_resolve_ms: module_build.name_resolve_ms,
+        compiler_new_ms,
+        emit_ms,
+        emit,
+        ir_text_ms,
+        backend,
+        load_module_ms,
+        load_function_ms,
+        // Module building happens in `compile_from_context`, before this
+        // function is entered, so `t0` misses it. The extra tileiras runs from
+        // `CUTILE_JIT_TILEIRAS_SAMPLES` happen inside it, so `t0` over-counts.
+        total_ms: module_build_ms + t0.elapsed().as_secs_f64() * 1000.0 - backend.probe_overhead_ms,
+    };
+    LAST_JIT_TIMINGS.with(|slot| slot.set(Some(timings)));
 
     jit_log!(
         "{module_name}::{function_name} → JIT compiled in {:.1?}",
@@ -362,7 +504,21 @@ fn compile_and_load_kernel(
     );
     if std::env::var_os("CUTILE_JIT_TIMING").is_some() {
         eprintln!(
-            "CUTILE_JIT_TIMING module={module_name} function={function_name} key={key_str} stage1_ms={stage1_ms:.3} stage2_ms={stage2_ms:.3} stage3_ms={stage3_ms:.3} generics={}",
+            "CUTILE_JIT_TIMING module={module_name} function={function_name} key={key_str} \
+             module_ast_ms={:.3} name_resolve_ms={:.3} compiler_new_ms={compiler_new_ms:.3} \
+             emit_ms={emit_ms:.3} stage1_ms={stage1_ms:.3} \
+             stage2_ms={stage2_ms:.3} stage3_ms={stage3_ms:.3} \
+             verify_ms={:.3} serialize_ms={:.3} write_bc_ms={:.3} tileiras_ms={:.3} \
+             bytecode_len={} cubin_len={} skippable_pct={:.1} generics={}",
+            module_build.ast_ms,
+            module_build.name_resolve_ms,
+            backend.verify_ms,
+            backend.serialize_ms,
+            backend.write_bc_ms,
+            backend.tileiras_ms,
+            backend.bytecode_len,
+            backend.cubin_len,
+            timings.skippable_fraction() * 100.0,
             generics.join(","),
         );
     }
@@ -459,6 +615,7 @@ pub fn compile_from_context<F: Fn() -> Module>(
         jit_log!("{module_name}::{function_name} → JIT compiling...");
         // Build the module ASTs lazily — only on a real cache miss.
         let modules = CUDATileModules::from_kernel(kernel_ast())?;
+        let module_build = take_module_build_timings().unwrap_or_default();
         let kernel = compile_and_load_kernel(
             &modules,
             module_name,
@@ -473,6 +630,7 @@ pub fn compile_from_context<F: Fn() -> Module>(
             &key.compile_options,
             device_id,
             &key_str,
+            module_build,
         )?;
         // Count only a successful compile: a failed attempt leaves the slot empty
         // and retries, so counting at the top would double-count on retry and
