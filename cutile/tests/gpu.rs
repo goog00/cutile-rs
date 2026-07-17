@@ -58,3 +58,6 @@ mod warmup;
 
 #[path = "gpu/warmup_bench.rs"]
 mod warmup_bench;
+
+#[path = "gpu/execute_warmup.rs"]
+mod execute_warmup;

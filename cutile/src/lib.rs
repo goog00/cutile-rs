@@ -184,6 +184,7 @@ pub mod prelude;
 pub mod tensor;
 pub mod tile_kernel;
 pub mod utils;
+pub mod warmup;
 
 pub use cuda_async;
 pub use cuda_core;

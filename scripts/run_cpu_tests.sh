@@ -90,6 +90,10 @@ run_step \
     "cutile warmup/cache-key CPU tests" \
     cargo test -p cutile --test warmup
 
+run_step \
+    "cutile execute_warmup orchestrator CPU tests" \
+    cargo test -p cutile --test execute_warmup
+
 print_summary_and_exit \
     "All CPU tests passed!" \
     "Some CPU checks failed. See output above for details."
