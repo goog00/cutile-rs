@@ -54,6 +54,28 @@ pub(crate) fn release_execution_lock() {
     });
 }
 
+/// RAII guard that releases the execution lock on drop — including while a
+/// panic unwinds through the guarded region. A bare
+/// `acquire`/`release_execution_lock` pair leaks the lock if the work between
+/// them panics: `release` is skipped, the thread-local flag stays `true`, and
+/// every later `DeviceOp` on that thread fails as "non-reentrant". Prefer this
+/// guard on any path whose guarded work can panic (e.g. a meta-tensor launch
+/// tripping the device-pointer guardrail during argument marshaling).
+#[must_use]
+pub(crate) struct ExecutionLockGuard(());
+
+impl Drop for ExecutionLockGuard {
+    fn drop(&mut self) {
+        release_execution_lock();
+    }
+}
+
+/// Acquire the execution lock, returning a guard that releases it on drop.
+pub(crate) fn execution_lock() -> Result<ExecutionLockGuard, DeviceError> {
+    acquire_execution_lock()?;
+    Ok(ExecutionLockGuard(()))
+}
+
 pub type DeviceOrdinal = usize;
 
 #[derive(Debug, Clone)]
@@ -374,11 +396,13 @@ pub trait DeviceOp:
     /// stream are guaranteed to execute in call order. Use this when you need deterministic
     /// ordering or are debugging concurrency issues.
     fn sync_on(self, stream: &Arc<Stream>) -> Result<<Self as DeviceOp>::Output, DeviceError> {
-        acquire_execution_lock()?;
+        // Guard, not a bare acquire/release: `self.execute` can panic (e.g. a
+        // meta tensor tripping the device-pointer guardrail), and the lock must
+        // still be released so later ops on this thread are not blocked.
+        let _exec_guard = execution_lock()?;
         let ctx = ExecutionContext::new(stream.clone());
         let res = unsafe { self.execute(&ctx) };
         let sync_res = unsafe { stream.synchronize() };
-        release_execution_lock();
         sync_res?;
         res
     }
