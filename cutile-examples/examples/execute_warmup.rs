@@ -100,28 +100,11 @@ fn main() {
         }),
     ]);
 
-    println!(
-        "\nexecute_warmup: {}/{} ok in {:.1?}",
-        report.ok_count(),
-        report.results.len(),
-        report.total_elapsed,
-    );
-    for r in &report.results {
-        println!(
-            "  {:<24} {:>9.1?}  jit+{} disk+{} backend+{}  {}",
-            r.label,
-            r.elapsed,
-            r.jit_compiles,
-            r.disk_hits,
-            r.backend_compiles,
-            match (&r.outcome, r.recompiled()) {
-                (Err(e), _) => format!("FAILED: {e}"),
-                (Ok(()), true) => "RECOMPILED — warmup list does not match".to_string(),
-                (Ok(()), false) if r.fully_warm() => "fully warm".to_string(),
-                (Ok(()), false) => "warm via disk".to_string(),
-            },
-        );
-    }
+    // `WarmupReport`'s `Display` renders the whole thing — a one-line header
+    // (counts, total time, aggregate compile activity) plus one aligned line
+    // per hook — ready to drop into a startup log.
+    println!("\n{report}");
+
     assert!(
         report.all_ok() && report.all_warm(),
         "warmup must be clean: {report:?}"

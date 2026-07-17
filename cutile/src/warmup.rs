@@ -23,6 +23,7 @@
 //! cutile::jit_cache::enable_default()?;         // optional L2 disk cache
 //! /* batch of meta `.compile()` calls */        // pre-pay compilation
 //! let report = cutile::warmup::execute_warmup(vec![/* hooks */]);
+//! println!("{report}");                          // one-line-per-hook summary
 //! assert!(report.all_ok() && report.all_warm());
 //! ```
 //!
@@ -45,6 +46,7 @@
 //! kernels launched inside a hook (`api::ones` compiles a fill kernel on first
 //! use) are counted too — they are being warmed as well.
 
+use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -179,6 +181,107 @@ impl WarmupReport {
     pub fn all_warm(&self) -> bool {
         self.results.iter().all(HookResult::fully_warm)
     }
+
+    /// Total frontend (in-memory miss) compiles across all hooks.
+    pub fn total_jit_compiles(&self) -> u64 {
+        self.results.iter().map(|r| r.jit_compiles).sum()
+    }
+
+    /// Total on-disk cubin cache hits across all hooks.
+    pub fn total_disk_hits(&self) -> u64 {
+        self.results.iter().map(|r| r.disk_hits).sum()
+    }
+
+    /// Total `tileiras` backend compiles (the expensive event) across all hooks.
+    pub fn total_backend_compiles(&self) -> u64 {
+        self.results.iter().map(|r| r.backend_compiles).sum()
+    }
+
+    /// Total soft disk-cache I/O failures across all hooks.
+    pub fn total_disk_io_errors(&self) -> u64 {
+        self.results.iter().map(|r| r.disk_io_errors).sum()
+    }
+
+    /// Whether any hook triggered an expensive `tileiras` recompile — the direct
+    /// answer to "did any recompilation happen during warmup". After a
+    /// `.compile()` pass, `true` signals a warmup/production key mismatch.
+    pub fn any_recompiled(&self) -> bool {
+        self.results.iter().any(HookResult::recompiled)
+    }
+}
+
+/// Human-readable summary for startup logs: a one-line header followed by one
+/// aligned line per hook. Cache-counter suffixes appear only when nonzero, so a
+/// fully-warm run stays quiet. A failed hook appends its (first-line, truncated)
+/// error after any counters, so a hook that compiled and then failed shows both.
+///
+/// ```text
+/// execute_warmup: 3 hooks, 2 ok, 1 failed, 512.4ms total (jit+2 disk+0 backend+2)
+///   ok      vector_add.f32.128     3.2ms
+///   ok      matmul.f16.prod      421.7ms  jit+1 disk+0 backend+1
+///   FAILED  softmax.f32           88.1ms  jit+1 disk+0 backend+1  error: Launch grid required.
+/// ```
+impl fmt::Display for WarmupReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = self.results.len();
+        write!(
+            f,
+            "execute_warmup: {n} hook{}, {} ok, {} failed, {} total",
+            if n == 1 { "" } else { "s" },
+            self.ok_count(),
+            self.err_count(),
+            fmt_duration(self.total_elapsed),
+        )?;
+
+        let jit = self.total_jit_compiles();
+        let disk = self.total_disk_hits();
+        let backend = self.total_backend_compiles();
+        let io = self.total_disk_io_errors();
+        if jit + disk + backend + io > 0 {
+            write!(f, " (jit+{jit} disk+{disk} backend+{backend}")?;
+            if io > 0 {
+                write!(f, " io_errors+{io}")?;
+            }
+            write!(f, ")")?;
+        }
+
+        if self.results.is_empty() {
+            return Ok(());
+        }
+
+        // Align the label and elapsed columns across all hooks.
+        let label_w = self.results.iter().map(|r| r.label.len()).max().unwrap_or(0);
+        let times: Vec<String> = self.results.iter().map(|r| fmt_duration(r.elapsed)).collect();
+        let time_w = times.iter().map(String::len).max().unwrap_or(0);
+
+        for (r, time) in self.results.iter().zip(&times) {
+            let status = if r.outcome.is_ok() { "ok" } else { "FAILED" };
+            write!(
+                f,
+                "\n  {status:<6}  {label:<lw$}  {time:>tw$}",
+                status = status,
+                label = r.label,
+                time = time,
+                lw = label_w,
+                tw = time_w,
+            )?;
+            // Counter suffix (when nonzero) first, then the error for a failed
+            // hook — a hook that compiled and *then* failed shows both.
+            write_hook_counters(
+                f,
+                r.jit_compiles,
+                r.disk_hits,
+                r.backend_compiles,
+                r.disk_io_errors,
+            )?;
+            if let Err(e) = &r.outcome {
+                let msg = e.to_string();
+                let line = msg.lines().next().unwrap_or("");
+                write!(f, "  {}", truncate(line, 80))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Runs the hooks one by one on the calling thread's default device.
@@ -254,6 +357,42 @@ fn run_hooks(device_id: usize, hooks: Vec<WarmupHook>) -> WarmupReport {
         results,
         total_elapsed: total_start.elapsed(),
     }
+}
+
+/// Writes one hook's ` jit+.. disk+.. backend+..` counter suffix, but only when
+/// something actually moved — a fully-warm hook stays bare. Shared by the ok and
+/// failed branches so a hook that compiled and then failed still shows both.
+fn write_hook_counters(
+    f: &mut fmt::Formatter<'_>,
+    jit: u64,
+    disk: u64,
+    backend: u64,
+    io: u64,
+) -> fmt::Result {
+    if jit + disk + backend + io == 0 {
+        return Ok(());
+    }
+    write!(f, "  jit+{jit} disk+{disk} backend+{backend}")?;
+    if io > 0 {
+        write!(f, " io_errors+{io}")?;
+    }
+    Ok(())
+}
+
+/// Formats a [`Duration`] the same way the per-hook log line does (one decimal,
+/// unit-adaptive), so the summary and the `CUTILE_JIT_LOG` output agree.
+fn fmt_duration(d: Duration) -> String {
+    format!("{d:.1?}")
+}
+
+/// Truncates a single line to at most `max` chars, appending `…` when cut, so a
+/// long error message can't wrap the summary across many terminal lines.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// Normalizes a hook panic into an [`Error`], extracting the usual string
